@@ -161,16 +161,23 @@ class Store:
             ).fetchall()
         return [{"version": version, "title": title} for version, title in rows]
 
-    def search(self, query: str) -> list[dict]:
+    def search(self, query: str, sort: str = "id") -> list[dict]:
         """按每篇文档的最新标题做忽略大小写的字面子串匹配。
 
         匹配在 Python 端用 str.casefold 完成，%、_、*、[、] 等均为普通
         字符，不读取正文与历史标题。返回 [{id, version, title}, ...]，
-        按文档 ID 升序，标题保留原文，不产生任何修订或文件。
+        标题保留原文，不产生任何修订或文件。
+
+        sort 为 "id"（默认）时按文档 ID 升序；为 "relevance" 时按标题
+        匹配程度分组：完全相等的最前，以查询词开头的其次，其余包含
+        查询词的最后，同组内按文档 ID 升序。分组沿用与匹配相同的
+        casefold 语义，不按出现次数、标题长度或版本号再排序。
 
         根目录不存在或目录下尚无索引文件时返回 []，不创建目录或索引；
         根路径不是目录，或已有索引无法打开/完成查询时抛出 KBError。
         """
+        if sort not in ("id", "relevance"):
+            raise KBError(f"未知的排序方式: {sort}")
         if self.root.exists() and not self.root.is_dir():
             raise KBError(f"知识库根路径不是目录: {self.root}")
         if not self.root.is_dir() or not self.db_path.exists():
@@ -191,8 +198,19 @@ class Store:
                 ).fetchall()
         except sqlite3.Error as exc:
             raise KBError(f"索引无法打开或查询失败: {exc}") from exc
-        return [
+        hits = [
             {"id": doc_id, "version": version, "title": title}
             for doc_id, version, title in rows
             if needle in title.casefold()
         ]
+        if sort == "relevance":
+            def group(item: dict) -> int:
+                folded = item["title"].casefold()
+                if folded == needle:
+                    return 0
+                if folded.startswith(needle):
+                    return 1
+                return 2
+
+            hits.sort(key=lambda item: (group(item), item["id"]))
+        return hits

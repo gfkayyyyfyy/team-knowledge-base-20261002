@@ -64,6 +64,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_search = sub.add_parser("search", help="按最新标题字面子串检索文档")
     p_search.add_argument("query", metavar="QUERY", type=search_query_arg, help="标题查询词")
+    p_search.add_argument(
+        "--sort",
+        choices=["id", "relevance"],
+        default="id",
+        help="结果排序：id 按文档 ID 升序（默认）；relevance 按标题匹配程度分组",
+    )
 
     return parser
 
@@ -89,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "history":
             print(json.dumps(store.history(args.id), ensure_ascii=False))
         elif args.command == "search":
-            print(json.dumps(store.search(args.query), ensure_ascii=False))
+            print(json.dumps(store.search(args.query, sort=args.sort), ensure_ascii=False))
     except KBError as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 2
