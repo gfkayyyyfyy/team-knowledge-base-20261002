@@ -149,6 +149,40 @@ class Store:
             )
         return data
 
+    def search(self, query: str) -> list[dict]:
+        """按最新标题做忽略大小写的字面子串匹配。
+
+        返回 [{id, version, title}, ...]，按文档 ID 升序，每篇文档最多一次。
+        只读操作：根目录不存在或尚无索引时返回空列表，不创建任何文件；
+        根路径已存在但不是目录、或已有索引无法打开或完成查询时抛出 KBError。
+        """
+        if self.root.exists() and not self.root.is_dir():
+            raise KBError(f"根路径不是目录: {self.root}")
+        if not self.db_path.is_file():
+            return []
+        needle = query.casefold()
+        try:
+            # 以只读方式打开已有索引，避免查询产生任何文件改动
+            conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+            try:
+                rows = conn.execute(
+                    "SELECT v.doc_id, v.version, v.title FROM versions v"
+                    " JOIN (SELECT doc_id, MAX(version) AS max_version"
+                    " FROM versions GROUP BY doc_id) latest"
+                    " ON v.doc_id = latest.doc_id"
+                    " AND v.version = latest.max_version"
+                    " ORDER BY v.doc_id ASC"
+                ).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            raise KBError(f"无法打开或查询索引: {exc}")
+        return [
+            {"id": doc_id, "version": version, "title": title}
+            for doc_id, version, title in rows
+            if needle in title.casefold()
+        ]
+
     def history(self, doc_id: int) -> list[dict]:
         """按版本号升序返回 [{version, title}, ...]，不产生修订。"""
         self._require_initialized(doc_id)
