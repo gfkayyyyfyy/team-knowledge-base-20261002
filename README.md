@@ -24,11 +24,12 @@ python -m knowledge_base --root KB_DIR show ID [--version N]
 python -m knowledge_base --root KB_DIR history ID
 
 # 按最新标题做忽略大小写的字面子串检索：[{"id": ..., "version": ..., "title": "..."}, ...]
-python -m knowledge_base --root KB_DIR search QUERY
+# 默认按文档 ID 升序；--sort relevance 时按标题相关度分组排序
+python -m knowledge_base --root KB_DIR search QUERY [--sort id|relevance]
 ```
 
 - add / update 成功后，标准输出返回 `{"id": ..., "version": ..., "title": "..."}`。
-- search 仅匹配每篇文档的最新标题（不搜正文与历史标题），QUERY 去除首尾空白后匹配，内部空格原样保留，按 Unicode casefold 语义忽略大小写；`%`、`_`、`*`、`[`、`]` 等均为普通字符，结果按文档 ID 升序且每篇至多一条。根目录不存在、目录尚无索引或无命中时输出 `[]`（退出码 0），不创建目录或索引；QUERY 缺失/空白、根路径不是目录或索引无法查询时以退出码 2 报错，标准输出为空。
+- search 仅匹配每篇文档的最新标题（不搜正文与历史标题），QUERY 去除首尾空白后匹配，内部空格原样保留，按 Unicode casefold 语义忽略大小写；`%`、`_`、`*`、`[`、`]` 等均为普通字符，每篇至多一条。默认（或 `--sort id`）按文档 ID 升序；`--sort relevance` 时依次返回与查询词完全相等、以查询词开头、其他包含查询词的标题，同一组内按文档 ID 升序，不按出现次数、标题长度或版本号排序。根目录不存在、目录尚无索引或无命中时输出 `[]`（退出码 0），不创建目录或索引；QUERY 缺失/空白、`--sort` 缺值或取值非法、根路径不是目录或索引无法查询时以退出码 2 报错，标准输出为空。
 - 标题去除首尾空白后应为非空单行文本；正文允许为空，中文、空行及末尾换行按输入保留，不解析或改写 Markdown。
 - 历史版本同时保留当时的标题和正文，标题变更不影响旧版本读取。
 - 参数非法、文档或版本不存在、正文文件缺失/非普通文件/非 UTF-8 时，命令以退出码 2 结束，原因写入标准错误，标准输出为空，已有数据不变；有效命令以退出码 0 结束。
