@@ -110,24 +110,44 @@ class Store:
         return version
 
     def get_body(self, doc_id: int, version: int | None = None) -> bytes:
-        """读取指定版本正文；version 为 None 时读取最新版本。"""
+        """读取指定版本正文；version 为 None 时读取最新版本。
+
+        所选正文文件缺失、不是普通文件或无法按 UTF-8 解码时抛出 KBError，
+        不回退到其他版本。
+        """
         self._require_initialized(doc_id)
         with self._connect() as conn:
             self._require_document(conn, doc_id)
             if version is None:
                 row = conn.execute(
-                    "SELECT body_path FROM versions WHERE doc_id = ?"
+                    "SELECT version, body_path FROM versions WHERE doc_id = ?"
                     " ORDER BY version DESC LIMIT 1",
                     (doc_id,),
                 ).fetchone()
             else:
                 row = conn.execute(
-                    "SELECT body_path FROM versions WHERE doc_id = ? AND version = ?",
+                    "SELECT version, body_path FROM versions WHERE doc_id = ?"
+                    " AND version = ?",
                     (doc_id, version),
                 ).fetchone()
         if row is None:
             raise KBError(f"版本不存在: 文档 {doc_id} 的版本 {version}")
-        return (self.root / row[0]).read_bytes()
+        selected_version, rel = row
+        path = self.root / rel
+        if not path.is_file():
+            raise KBError(
+                f"正文文件缺失或不是普通文件: 文档 {doc_id} 的版本"
+                f" {selected_version} ({rel})"
+            )
+        data = path.read_bytes()
+        try:
+            data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise KBError(
+                f"正文无法按 UTF-8 解码: 文档 {doc_id} 的版本"
+                f" {selected_version} ({rel})"
+            )
+        return data
 
     def history(self, doc_id: int) -> list[dict]:
         """按版本号升序返回 [{version, title}, ...]，不产生修订。"""
