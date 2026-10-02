@@ -160,3 +160,39 @@ class Store:
                 (doc_id,),
             ).fetchall()
         return [{"version": version, "title": title} for version, title in rows]
+
+    def search(self, query: str) -> list[dict]:
+        """按每篇文档的最新标题做忽略大小写的字面子串匹配。
+
+        匹配在 Python 端用 str.casefold 完成，%、_、*、[、] 等均为普通
+        字符，不读取正文与历史标题。返回 [{id, version, title}, ...]，
+        按文档 ID 升序，标题保留原文，不产生任何修订或文件。
+
+        根目录不存在或目录下尚无索引文件时返回 []，不创建目录或索引；
+        根路径不是目录，或已有索引无法打开/完成查询时抛出 KBError。
+        """
+        if self.root.exists() and not self.root.is_dir():
+            raise KBError(f"知识库根路径不是目录: {self.root}")
+        if not self.root.is_dir() or not self.db_path.exists():
+            return []
+        needle = query.casefold()
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT v.doc_id, v.version, v.title"
+                    " FROM versions AS v"
+                    " JOIN ("
+                    "     SELECT doc_id, MAX(version) AS latest_version"
+                    "     FROM versions GROUP BY doc_id"
+                    " ) AS latest"
+                    " ON v.doc_id = latest.doc_id"
+                    " AND v.version = latest.latest_version"
+                    " ORDER BY v.doc_id ASC"
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise KBError(f"索引无法打开或查询失败: {exc}") from exc
+        return [
+            {"id": doc_id, "version": version, "title": title}
+            for doc_id, version, title in rows
+            if needle in title.casefold()
+        ]

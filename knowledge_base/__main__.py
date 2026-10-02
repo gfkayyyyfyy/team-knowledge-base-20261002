@@ -1,4 +1,4 @@
-"""命令行入口：python -m knowledge_base --root DIR <add|update|show|history>。"""
+"""命令行入口：python -m knowledge_base --root DIR <add|update|show|history|search>。"""
 
 from __future__ import annotations
 
@@ -30,6 +30,14 @@ def title_arg(value: str) -> str:
     return title
 
 
+def search_query_arg(value: str) -> str:
+    """argparse 类型：去除首尾空白后非空的查询词，内部空白原样保留。"""
+    query = value.strip()
+    if not query:
+        raise argparse.ArgumentTypeError("QUERY 去除首尾空白后不能为空")
+    return query
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="knowledge_base",
@@ -54,6 +62,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_history = sub.add_parser("history", help="列出文档全部版本")
     p_history.add_argument("id", type=positive_int, help="文档 ID")
 
+    p_search = sub.add_parser("search", help="按最新标题字面子串检索文档")
+    p_search.add_argument("query", metavar="QUERY", type=search_query_arg, help="标题查询词")
+
     return parser
 
 
@@ -77,6 +88,8 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout.buffer.write(body)
         elif args.command == "history":
             print(json.dumps(store.history(args.id), ensure_ascii=False))
+        elif args.command == "search":
+            print(json.dumps(store.search(args.query), ensure_ascii=False))
     except KBError as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 2
