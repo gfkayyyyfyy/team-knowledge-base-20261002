@@ -1,0 +1,87 @@
+"""命令行入口：python -m knowledge_base --root DIR <add|update|show|history>。"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+
+from .store import KBError, Store, read_body_file
+
+
+def positive_int(value: str) -> int:
+    """argparse 类型：正整数。"""
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"不是有效的整数: {value}")
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"必须是正整数: {value}")
+    return number
+
+
+def title_arg(value: str) -> str:
+    """argparse 类型：去除首尾空白后非空的单行标题。"""
+    title = value.strip()
+    if not title:
+        raise argparse.ArgumentTypeError("标题去除首尾空白后不能为空")
+    if "\n" in title or "\r" in title:
+        raise argparse.ArgumentTypeError("标题必须为单行文本")
+    return title
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="knowledge_base",
+        description="本地团队知识库：Markdown 文档的保存与修订读取",
+    )
+    parser.add_argument("--root", required=True, help="知识库根目录")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_add = sub.add_parser("add", help="新增文档，生成版本 1")
+    p_add.add_argument("--title", required=True, type=title_arg, help="文档标题")
+    p_add.add_argument("--file", required=True, help="正文 Markdown 文件路径")
+
+    p_update = sub.add_parser("update", help="更新文档，生成下一个连续版本")
+    p_update.add_argument("id", type=positive_int, help="文档 ID")
+    p_update.add_argument("--title", required=True, type=title_arg, help="文档标题")
+    p_update.add_argument("--file", required=True, help="正文 Markdown 文件路径")
+
+    p_show = sub.add_parser("show", help="输出文档正文，默认最新版本")
+    p_show.add_argument("id", type=positive_int, help="文档 ID")
+    p_show.add_argument("--version", type=positive_int, default=None, help="版本号")
+
+    p_history = sub.add_parser("history", help="列出文档全部版本")
+    p_history.add_argument("id", type=positive_int, help="文档 ID")
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    store = Store(args.root)
+    try:
+        if args.command == "add":
+            data = read_body_file(args.file)
+            doc_id, version = store.add(args.title, data)
+            result = {"id": doc_id, "version": version, "title": args.title}
+            print(json.dumps(result, ensure_ascii=False))
+        elif args.command == "update":
+            data = read_body_file(args.file)
+            version = store.update(args.id, args.title, data)
+            result = {"id": args.id, "version": version, "title": args.title}
+            print(json.dumps(result, ensure_ascii=False))
+        elif args.command == "show":
+            body = store.get_body(args.id, args.version)
+            # 原样输出正文，不额外添加标题或换行
+            sys.stdout.buffer.write(body)
+        elif args.command == "history":
+            print(json.dumps(store.history(args.id), ensure_ascii=False))
+    except KBError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
