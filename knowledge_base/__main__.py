@@ -20,6 +20,26 @@ def positive_int(value: str) -> int:
     return number
 
 
+def limit_arg(value: str) -> int:
+    """argparse 类型：--limit 的数量参数，仅接受严格的正整数。
+
+    与 int(value) 不同，这里只接受 ASCII 十进制数字组成的非空串，
+    不接受带空白、正负号、小数点或下划线的写法（如 " 2"、"+2"、
+    "2.0"、"1_0"），也不接受上标等非 ASCII 数字字符；空值、零与
+    负数同样拒绝，使数量参数的合法形式唯一确定。
+    """
+    if not value or not all("0" <= ch <= "9" for ch in value):
+        raise argparse.ArgumentTypeError(
+            f"数量参数必须是正整数: {value!r}"
+        )
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError(
+            f"数量参数必须是正整数: {value!r}"
+        )
+    return number
+
+
 def title_arg(value: str) -> str:
     """argparse 类型：去除首尾空白后非空的单行标题。"""
     title = value.strip()
@@ -70,6 +90,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="id",
         help="结果排序：id 按文档 ID 升序（默认）；relevance 按标题匹配程度分组",
     )
+    p_search.add_argument(
+        "--limit",
+        type=limit_arg,
+        default=None,
+        metavar="N",
+        help="只返回当前排序下最前面的 N 条结果，N 为正整数；省略时返回全部命中",
+    )
 
     return parser
 
@@ -95,7 +122,12 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "history":
             print(json.dumps(store.history(args.id), ensure_ascii=False))
         elif args.command == "search":
-            print(json.dumps(store.search(args.query, sort=args.sort), ensure_ascii=False))
+            print(
+                json.dumps(
+                    store.search(args.query, sort=args.sort, limit=args.limit),
+                    ensure_ascii=False,
+                )
+            )
     except KBError as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 2

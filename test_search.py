@@ -9,7 +9,10 @@
 - 匹配与分组使用 Unicode casefold 语义；
 - QUERY 去除首尾空白，内部空格按字面保留；
 - 只匹配最新标题，不搜正文与历史标题；
-- QUERY 缺失/空白、--sort 缺值/非法取值以退出码 2 报错，标准输出为空；
+- ``--limit N`` 在最终排序后截取前 N 条，与不设上限的同一次查询前 N 条
+  完全一致，命中不足时返回全部，不补空项、不附加总数或截断提示；
+- QUERY 缺失/空白、--sort 缺值/非法取值、--limit 缺值或不是正整数
+  （空值、零、负数、小数、非整数字符串）以退出码 2 报错，标准输出为空；
 - 无命中、根目录不存在、目录尚无索引时输出 ``[]``（退出码 0），
   不创建目录或索引；
 - 根路径不是目录、索引文件不是数据库、索引缺少 versions 表时，
@@ -148,6 +151,91 @@ class RelevanceSortTests(KbTestCase):
             "--sort", "relevance",
         )
 
+    def test_limit_with_default_id_sort(self):
+        # 验收场景：--limit 2 作用于 ID 升序的最终结果，
+        # 依次返回 发布流程 与 预发布检查
+        self.assert_search(
+            "发布",
+            [self.entry(0), self.entry(1)],
+            "--limit", "2",
+        )
+
+    def test_limit_with_explicit_id_sort(self):
+        self.assert_search(
+            "发布",
+            [self.entry(0), self.entry(1)],
+            "--sort", "id", "--limit", "2",
+        )
+
+    def test_limit_with_relevance_sort(self):
+        # 验收场景：relevance 下 --limit 2 依次返回 发布 与 发布流程
+        self.assert_search(
+            "发布",
+            [self.entry(2), self.entry(0)],
+            "--sort", "relevance", "--limit", "2",
+        )
+
+    def test_limited_results_equal_prefix_of_unlimited(self):
+        # 各排序下，带 --limit 的结果与同一次不设上限查询的前 N 条完全一致
+        for extra in [(), ("--sort", "id"), ("--sort", "relevance")]:
+            full = run_cli("--root", str(self.kb), "search", "发布", *extra)
+            self.assertEqual(full.returncode, 0, full.stderr.decode("utf-8"))
+            expected = json.loads(full.stdout)[:2]
+            limited = run_cli(
+                "--root", str(self.kb), "search", "发布", *extra,
+                "--limit", "2",
+            )
+            self.assertEqual(limited.returncode, 0, limited.stderr.decode("utf-8"))
+            self.assertEqual(limited.stderr, b"")
+            self.assertEqual(json.loads(limited.stdout), expected)
+            for hit in json.loads(limited.stdout):
+                self.assertEqual(set(hit), {"id", "version", "title"})
+
+    def test_limit_one_per_sort(self):
+        self.assert_search("发布", [self.entry(0)], "--limit", "1")
+        self.assert_search(
+            "发布", [self.entry(2)], "--sort", "relevance", "--limit", "1"
+        )
+
+    def test_limit_larger_than_hit_count_returns_all_hits(self):
+        # 命中 4 条、上限 9 时返回全部 4 条，不补空项
+        self.assert_search(
+            "发布",
+            [self.entry(0), self.entry(1), self.entry(2), self.entry(3)],
+            "--limit", "9",
+        )
+        self.assert_search(
+            "发布",
+            [self.entry(2), self.entry(0), self.entry(3), self.entry(1)],
+            "--sort", "relevance", "--limit", "9",
+        )
+
+    def test_limit_does_not_append_total_or_truncation_notice(self):
+        # 输出仅为 JSON 数组本身，不附加总数或截断提示字段
+        result = run_cli(
+            "--root", str(self.kb), "search", "发布", "--limit", "2"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8"))
+        hits = json.loads(result.stdout)
+        self.assertEqual(len(hits), 2)
+        self.assertEqual(result.stdout.decode("utf-8").count("{"), 2)
+        self.assertNotIn("total", result.stdout.decode("utf-8"))
+        self.assertNotIn("截断", result.stderr.decode("utf-8"))
+
+    def test_limit_after_update_old_title_cannot_fill_slots(self):
+        # 第三篇更新为不含“发布”的标题后，上限不能被旧标题/正文补足
+        self.update_doc(self.ids[2], "归档说明", "正文仍然提到发布。\n")
+        # id 排序前两名仍是 发布流程、预发布检查；id3 已不命中
+        self.assert_search(
+            "发布", [self.entry(0), self.entry(1)], "--limit", "2"
+        )
+        # relevance 下完全相等组消失，前两名是前缀组的 发布流程、发布记录
+        self.assert_search(
+            "发布",
+            [self.entry(0), self.entry(3)],
+            "--sort", "relevance", "--limit", "2",
+        )
+
     def test_surrounding_whitespace_stripped(self):
         # 首尾空白（含制表符、换行）被去除，结果与裸查询一致
         self.assert_search(
@@ -182,12 +270,23 @@ class RelevanceSortTests(KbTestCase):
         before_files = snapshot(self.kb)
         before_history = self.histories(self.ids)
 
-        # 成功检索：默认、显式 id、relevance
-        for extra in [(), ("--sort", "id"), ("--sort", "relevance")]:
+        # 成功检索：默认、显式 id、relevance，以及带上限的查询
+        for extra in [
+            (),
+            ("--sort", "id"),
+            ("--sort", "relevance"),
+            ("--limit", "2"),
+            ("--sort", "relevance", "--limit", "2"),
+        ]:
             result = run_cli("--root", str(self.kb), "search", "发布", *extra)
             self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8"))
-        # 失败检索：QUERY 空白、--sort 非法取值
-        for args in [("   ",), ("发布", "--sort", "name")]:
+        # 失败检索：QUERY 空白、--sort 非法取值、--limit 非法取值
+        for args in [
+            ("   ",),
+            ("发布", "--sort", "name"),
+            ("发布", "--limit", "0"),
+            ("发布", "--limit", "1.5"),
+        ]:
             result = run_cli("--root", str(self.kb), "search", *args)
             self.assertEqual(result.returncode, 2)
             self.assertEqual(result.stdout, b"")
@@ -262,14 +361,42 @@ class EmptyResultTests(KbTestCase):
             run_cli("--root", str(self.kb), "search", "不存在的关键词")
         )
 
+    def test_no_hits_with_limit(self):
+        # 无命中时即使给出合法上限也输出 []，不补空项
+        self.add_doc("发布流程", "正文。\n")
+        self.assert_empty_array(
+            run_cli(
+                "--root", str(self.kb), "search", "不存在的关键词",
+                "--limit", "2",
+            )
+        )
+
     def test_missing_root_returns_empty_and_creates_nothing(self):
         missing = self.tmp / "no_such_dir"
         self.assert_empty_array(run_cli("--root", str(missing), "search", "发布"))
         self.assertFalse(missing.exists())
 
+    def test_missing_root_with_valid_limit_returns_empty_and_creates_nothing(self):
+        missing = self.tmp / "no_such_dir"
+        self.assert_empty_array(
+            run_cli(
+                "--root", str(missing), "search", "发布", "--limit", "2"
+            )
+        )
+        self.assertFalse(missing.exists())
+
     def test_dir_without_index_returns_empty_and_creates_nothing(self):
         self.kb.mkdir()
         self.assert_empty_array(run_cli("--root", str(self.kb), "search", "发布"))
+        self.assertEqual(list(self.kb.iterdir()), [])
+
+    def test_dir_without_index_with_limit_returns_empty_and_creates_nothing(self):
+        self.kb.mkdir()
+        self.assert_empty_array(
+            run_cli(
+                "--root", str(self.kb), "search", "发布", "--limit", "2"
+            )
+        )
         self.assertEqual(list(self.kb.iterdir()), [])
 
 
@@ -285,13 +412,21 @@ class StorageUnavailableTests(KbTestCase):
     QUERY = "发布"
 
     def assert_search_fails(self, reason: str) -> None:
-        """默认排序与 --sort relevance 均以退出码 2 失败，且输入保持原样。"""
+        """默认排序与 --sort relevance（含合法 --limit）均以退出码 2 失败。
+
+        合法上限不改变存储不可用的报错约定，且输入保持原样。
+        """
         before = snapshot(self.tmp)
-        for extra in [(), ("--sort", "relevance")]:
+        for extra in [
+            (),
+            ("--sort", "relevance"),
+            ("--limit", "2"),
+            ("--sort", "relevance", "--limit", "2"),
+        ]:
             result = run_cli(
                 "--root", str(self.kb), "search", self.QUERY, *extra
             )
-            label = extra[-1] if extra else "默认排序"
+            label = " ".join(extra) if extra else "默认排序"
             self.assertEqual(
                 result.returncode, 2,
                 f"{label}: 退出码应为 2: {result.returncode}",
@@ -359,9 +494,46 @@ class SearchArgumentErrorTests(KbTestCase):
     def test_sort_invalid_value(self):
         self.assert_error(("发布", "--sort", "name"), "invalid choice")
 
+    def test_limit_missing_value(self):
+        self.assert_error(("发布", "--limit"), "expected one argument")
+
+    def test_limit_empty_value(self):
+        # 通过 argv 显式传入空串：指出数量参数问题，而不是缺值文案
+        self.assert_error(("发布", "--limit", ""), "数量参数")
+
+    def test_limit_zero(self):
+        self.assert_error(("发布", "--limit", "0"), "数量参数")
+
+    def test_limit_negative(self):
+        self.assert_error(("发布", "--limit", "-1"), "数量参数")
+
+    def test_limit_decimal(self):
+        self.assert_error(("发布", "--limit", "1.5"), "数量参数")
+        self.assert_error(("发布", "--limit", "2.0"), "数量参数")
+
+    def test_limit_non_integer_string(self):
+        for bad in ["abc", "二", "1e3", "0x2", " 2", "2 ", "+2", "1_000", "²"]:
+            with self.subTest(bad=bad):
+                self.assert_error(("发布", "--limit", bad), "数量参数")
+
+    def test_limit_invalid_even_when_root_missing(self):
+        # 即使根目录不存在，非法数量也不能被当成成功的空结果：
+        # 参数解析先于存储访问，退出码 2、标准输出为空
+        missing = self.tmp / "no_such_dir"
+        for bad in ["", "0", "-1", "1.5", "abc"]:
+            with self.subTest(bad=bad):
+                result = run_cli(
+                    "--root", str(missing), "search", "发布", "--limit", bad
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, b"")
+                self.assertIn("数量参数", result.stderr.decode("utf-8"))
+        self.assertFalse(missing.exists())
+
     def test_argument_error_creates_nothing(self):
         # 参数错误在访问存储之前失败，不创建知识库目录
         self.assert_error(("   ",), "QUERY")
+        self.assert_error(("发布", "--limit", "0"), "数量参数")
         self.assertFalse(self.kb.exists())
 
 
