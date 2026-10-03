@@ -12,6 +12,8 @@
 - QUERY 缺失/空白、--sort 缺值/非法取值以退出码 2 报错，标准输出为空；
 - 无命中、根目录不存在、目录尚无索引时输出 ``[]``（退出码 0），
   不创建目录或索引；
+- 根路径不是目录、索引文件不是 SQLite 数据库、索引缺少 versions 表时
+  以退出码 2 报错，标准输出为空，不泄露 Traceback，输入内容保持原样；
 - 成功与失败检索均不改变知识库文件内容与修订记录。
 
 每个用例使用独立临时目录并在结束后清理，可离线重复运行。
@@ -22,6 +24,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -267,6 +270,85 @@ class EmptyResultTests(KbTestCase):
         self.kb.mkdir()
         self.assert_empty_array(run_cli("--root", str(self.kb), "search", "发布"))
         self.assertEqual(list(self.kb.iterdir()), [])
+
+
+class SearchStorageErrorTests(KbTestCase):
+    """本地存储不可用时 search 的报错与只读约定。
+
+    与 EmptyResultTests 对照：根目录不存在、目录尚无索引属于"尚未初始化"，
+    输出 [] 且退出码 0；以下三种状态属于已有存储不可用，必须以退出码 2
+    报错，标准输出为空（不输出空数组伪装成功），标准错误说明稳定的业务
+    原因且不泄露 Traceback，输入内容在检索前后保持原样。每种状态都用
+    有效查询词分别检查默认排序与 --sort relevance，确认排序选择不改变
+    错误结果。
+    """
+
+    QUERY = "发布"
+    DB_NAME = "knowledge_base.sqlite3"
+
+    def assert_storage_error(
+        self, root: Path, reason: str, watched: Path
+    ) -> None:
+        """对 root 以两种排序检索，均应以退出码 2 失败并说明 reason，
+        且 watched（root 本身或其所在目录）内容在检索前后完全一致。"""
+        before = snapshot(watched)
+        for label, extra in [("默认排序", ()), ("relevance", ("--sort", "relevance"))]:
+            result = run_cli("--root", str(root), "search", self.QUERY, *extra)
+            self.assertEqual(
+                result.returncode, 2,
+                f"{label}: 退出码应为 2: {result.returncode}",
+            )
+            self.assertEqual(
+                result.stdout, b"",
+                f"{label}: 标准输出应为空（不得输出空数组）: {result.stdout!r}",
+            )
+            err = result.stderr.decode("utf-8")
+            self.assertIn(reason, err, f"{label}: 标准错误应说明原因")
+            self.assertNotIn("Traceback", err, f"{label}: 不应泄露堆栈")
+        self.assertEqual(
+            snapshot(watched), before,
+            "失败检索不得修复、改写或新增任何条目",
+        )
+
+    def test_root_is_regular_file(self):
+        # --root 指向普通文件：报错说明根路径不是目录，文件字节不变
+        root_file = self.tmp / "kb_file"
+        root_file.write_bytes(b"not a directory\n")
+        self.assert_storage_error(root_file, "不是目录", self.tmp)
+        self.assertEqual(root_file.read_bytes(), b"not a directory\n")
+
+    def test_index_is_plain_text_file(self):
+        # 索引文件是普通 UTF-8 文本：报错说明索引无法打开或查询失败，
+        # 文件内容保持原样，不新增正文目录或其他文件
+        self.kb.mkdir()
+        db_file = self.kb / self.DB_NAME
+        db_file.write_text("这不是 SQLite 索引，只是普通文本。\n", encoding="utf-8")
+        self.assert_storage_error(self.kb, "索引无法打开或查询失败", self.kb)
+        self.assertEqual(
+            db_file.read_text(encoding="utf-8"),
+            "这不是 SQLite 索引，只是普通文本。\n",
+        )
+        self.assertEqual(sorted(p.name for p in self.kb.iterdir()), [self.DB_NAME])
+
+    def test_index_missing_versions_table(self):
+        # 索引是可打开的 SQLite 数据库但缺 versions 表：同样报错，
+        # 数据库字节保持原样，不补建索引表
+        self.kb.mkdir()
+        db_file = self.kb / self.DB_NAME
+        with sqlite3.connect(db_file) as conn:
+            conn.execute(
+                "CREATE TABLE documents (id INTEGER PRIMARY KEY AUTOINCREMENT)"
+            )
+            conn.execute("INSERT INTO documents DEFAULT VALUES")
+        self.assert_storage_error(self.kb, "索引无法打开或查询失败", self.kb)
+        with sqlite3.connect(db_file) as conn:
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+        self.assertNotIn("versions", tables)
 
 
 class SearchArgumentErrorTests(KbTestCase):
