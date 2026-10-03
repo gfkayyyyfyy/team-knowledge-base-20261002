@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import sqlite3
 from pathlib import Path
 
@@ -24,6 +25,43 @@ CREATE TABLE IF NOT EXISTS versions (
 
 class KBError(Exception):
     """可预期的业务错误，命令行统一以退出码 2 报告。"""
+
+
+def split_body_lines(text: str) -> list[str]:
+    """按 LF 划分正文行，CRLF 视同 LF；每行保留换行符，末行可能无换行。
+
+    空正文返回空列表；行内其他字符（含不成对的 \\r）原样保留。
+    """
+    text = text.replace("\r\n", "\n")
+    if not text:
+        return []
+    parts = text.split("\n")
+    lines = [part + "\n" for part in parts[:-1]]
+    if parts[-1]:
+        lines.append(parts[-1])
+    return lines
+
+
+def unified_diff(
+    old_text: str, new_text: str, fromfile: str, tofile: str
+) -> str:
+    """生成两份正文的统一差异文本，上下文三行，邻近变化合并。
+
+    输出统一使用 LF；末行无换行的差异行后补 \\ No newline at end of file。
+    两份正文相同时返回空字符串，不输出文件头。
+    """
+    old_lines = split_body_lines(old_text)
+    new_lines = split_body_lines(new_text)
+    out: list[str] = []
+    for line in difflib.unified_diff(
+        old_lines, new_lines, fromfile=fromfile, tofile=tofile, n=3
+    ):
+        if line.endswith("\n"):
+            out.append(line)
+        else:
+            out.append(line + "\n")
+            out.append("\\ No newline at end of file\n")
+    return "".join(out)
 
 
 def read_body_file(file_arg: str) -> bytes:
@@ -148,6 +186,28 @@ class Store:
                 f" {selected_version} ({rel})"
             )
         return data
+
+    def diff(self, doc_id: int, from_version: int, to_version: int) -> str:
+        """比较同一文档两个版本的正文，返回统一差异文本。
+
+        from_version 为差异旧侧，to_version 为新侧，允许逆序或相同。
+        文件头为 --- <id>/v<N>.md 与 +++ <id>/v<M>.md，不含路径与时间戳。
+        两份正文均按 get_body 的约定校验（存在、普通文件、UTF-8 可解码），
+        即使比较同一版本也不跳过检查；任一校验失败抛出 KBError，
+        不回退到其他版本。正文相同时返回空字符串。只读操作，
+        不产生修订，也不创建目录或索引。
+        """
+        try:
+            old = self.get_body(doc_id, from_version)
+            new = self.get_body(doc_id, to_version)
+        except sqlite3.Error as exc:
+            raise KBError(f"索引无法打开或查询失败: {exc}") from exc
+        return unified_diff(
+            old.decode("utf-8"),
+            new.decode("utf-8"),
+            fromfile=f"{doc_id}/v{from_version}.md",
+            tofile=f"{doc_id}/v{to_version}.md",
+        )
 
     def history(self, doc_id: int) -> list[dict]:
         """按版本号升序返回 [{version, title}, ...]，不产生修订。"""
