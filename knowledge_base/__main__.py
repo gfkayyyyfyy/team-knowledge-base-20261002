@@ -70,6 +70,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="id",
         help="结果排序：id 按文档 ID 升序（默认）；relevance 按标题匹配程度分组",
     )
+    p_search.add_argument(
+        "--limit",
+        metavar="N",
+        type=positive_int,
+        default=None,
+        help="只返回排序结果的前 N 条（正整数）；省略时返回全部命中",
+    )
 
     return parser
 
@@ -95,7 +102,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "history":
             print(json.dumps(store.history(args.id), ensure_ascii=False))
         elif args.command == "search":
-            print(json.dumps(store.search(args.query, sort=args.sort), ensure_ascii=False))
+            result = store.search(args.query, sort=args.sort, limit=args.limit)
+            print(json.dumps(result, ensure_ascii=False))
     except KBError as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 2

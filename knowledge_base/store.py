@@ -161,7 +161,9 @@ class Store:
             ).fetchall()
         return [{"version": version, "title": title} for version, title in rows]
 
-    def search(self, query: str, sort: str = "id") -> list[dict]:
+    def search(
+        self, query: str, sort: str = "id", limit: int | None = None
+    ) -> list[dict]:
         """按每篇文档的最新标题做忽略大小写的字面子串匹配。
 
         匹配在 Python 端用 str.casefold 完成，%、_、*、[、] 等均为普通
@@ -173,11 +175,17 @@ class Store:
         查询词的最后，同组内按文档 ID 升序。分组沿用与匹配相同的
         casefold 语义，不按出现次数、标题长度或版本号再排序。
 
+        limit 为正整数时只返回最终排序结果的前 limit 条，与不设上限的
+        同一查询前 limit 条完全一致；命中不足 limit 条时返回全部命中，
+        不补空项。limit 为 None 时返回全部命中。
+
         根目录不存在或目录下尚无索引文件时返回 []，不创建目录或索引；
         根路径不是目录，或已有索引无法打开/完成查询时抛出 KBError。
         """
         if sort not in ("id", "relevance"):
             raise KBError(f"未知的排序方式: {sort}")
+        if limit is not None and limit < 1:
+            raise KBError(f"数量上限必须是正整数: {limit}")
         if self.root.exists() and not self.root.is_dir():
             raise KBError(f"知识库根路径不是目录: {self.root}")
         if not self.root.is_dir() or not self.db_path.exists():
@@ -213,4 +221,6 @@ class Store:
                 return 2
 
             hits.sort(key=lambda item: (group(item), item["id"]))
+        if limit is not None:
+            hits = hits[:limit]
         return hits
