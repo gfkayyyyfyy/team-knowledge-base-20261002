@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import sqlite3
 from pathlib import Path
 
@@ -37,6 +38,49 @@ def read_body_file(file_arg: str) -> bytes:
     except UnicodeDecodeError:
         raise KBError(f"正文无法按 UTF-8 解码: {file_arg}")
     return data
+
+
+def _split_lines_keepends(text: str) -> list[str]:
+    """仅以 LF 划分行并保留行尾换行；空文本返回空列表。
+
+    不使用 str.splitlines，避免把单独的 \\r 等字符当作行边界；
+    只有最末一行可能不带换行符。
+    """
+    if not text:
+        return []
+    parts = text.split("\n")
+    lines = [part + "\n" for part in parts[:-1]]
+    if parts[-1]:
+        lines.append(parts[-1])
+    return lines
+
+
+def unified_body_diff(
+    old: bytes, new: bytes, from_label: str, to_label: str
+) -> str:
+    """生成两段 UTF-8 正文的统一差异文本，正文相同时返回空串。
+
+    比较前把 CRLF 规范化为 LF，输出统一使用 LF；每处变化最多保留
+    前后三行上下文，邻近变化按统一差异格式合并。文件头即 from_label
+    与 to_label，不附加标题、绝对路径或时间戳。末行是否带换行仍算
+    差异，缺少末尾换行的行之后追加 "\\ No newline at end of file"。
+    其余内容（中文、空行、行内空白、Markdown 符号）按原文比较。
+    """
+    old_text = old.decode("utf-8").replace("\r\n", "\n")
+    new_text = new.decode("utf-8").replace("\r\n", "\n")
+    old_lines = _split_lines_keepends(old_text)
+    new_lines = _split_lines_keepends(new_text)
+    parts: list[str] = []
+    for line in difflib.unified_diff(
+        old_lines, new_lines, fromfile=from_label, tofile=to_label, n=3
+    ):
+        if line.endswith("\n"):
+            parts.append(line)
+        else:
+            # 仅文件末行可能不带换行符，按统一差异约定补换行并加标示
+            parts.append(line + "\n")
+            parts.append("\\ No newline at end of file\n")
+    return "".join(parts)
 
 
 class Store:
@@ -148,6 +192,34 @@ class Store:
                 f" {selected_version} ({rel})"
             )
         return data
+
+    def diff(self, doc_id: int, from_version: int, to_version: int) -> str:
+        """对比同一文档两个版本的正文，返回统一差异文本（可能为空串）。
+
+        from_version 为差异旧侧，to_version 为新侧，允许逆序，也允许
+        两者相同；即使版本号相同，两侧也各自完整执行存在性与可读性
+        校验，不跳过损坏检查。文件头形如 "<id>/v<N>.md"。正文相同
+        （含仅标题不同）时返回空串，不输出文件头。
+
+        文档或任一版本不存在、根路径不是目录、索引无法查询，以及任一
+        所选正文缺失、不是普通文件或不能按 UTF-8 解码时抛出 KBError，
+        不产出半份差异，也不回退到其他版本。根目录不存在或尚无索引
+        同样报错，不创建目录或索引。本方法只读，不改变已有正文、索引
+        和历史，不生成新版本。
+        """
+        if self.root.exists() and not self.root.is_dir():
+            raise KBError(f"知识库根路径不是目录: {self.root}")
+        try:
+            old = self.get_body(doc_id, from_version)
+            new = self.get_body(doc_id, to_version)
+        except sqlite3.Error as exc:
+            raise KBError(f"索引无法打开或查询失败: {exc}") from exc
+        return unified_body_diff(
+            old,
+            new,
+            f"{doc_id}/v{from_version}.md",
+            f"{doc_id}/v{to_version}.md",
+        )
 
     def history(self, doc_id: int) -> list[dict]:
         """按版本号升序返回 [{version, title}, ...]，不产生修订。"""

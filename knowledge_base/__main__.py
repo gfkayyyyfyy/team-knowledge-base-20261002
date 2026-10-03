@@ -1,4 +1,4 @@
-"""命令行入口：python -m knowledge_base --root DIR <add|update|show|history|search>。"""
+"""命令行入口：python -m knowledge_base --root DIR <add|update|show|history|search|diff>。"""
 
 from __future__ import annotations
 
@@ -82,6 +82,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_history = sub.add_parser("history", help="列出文档全部版本")
     p_history.add_argument("id", type=positive_int, help="文档 ID")
 
+    p_diff = sub.add_parser("diff", help="对比同一文档两个版本的正文差异")
+    p_diff.add_argument("id", type=positive_int, help="文档 ID")
+    p_diff.add_argument(
+        "--from",
+        dest="from_version",
+        type=positive_int,
+        required=True,
+        help="差异旧侧版本号（正整数）",
+    )
+    p_diff.add_argument(
+        "--to",
+        dest="to_version",
+        type=positive_int,
+        required=True,
+        help="差异新侧版本号（正整数）",
+    )
+
     p_search = sub.add_parser("search", help="按最新标题字面子串检索文档")
     p_search.add_argument("query", metavar="QUERY", type=search_query_arg, help="标题查询词")
     p_search.add_argument(
@@ -121,6 +138,11 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout.buffer.write(body)
         elif args.command == "history":
             print(json.dumps(store.history(args.id), ensure_ascii=False))
+        elif args.command == "diff":
+            text = store.diff(args.id, args.from_version, args.to_version)
+            # 正文相同时 text 为空串，标准输出保持为空，不输出文件头
+            if text:
+                sys.stdout.buffer.write(text.encode("utf-8"))
         elif args.command == "search":
             print(
                 json.dumps(
