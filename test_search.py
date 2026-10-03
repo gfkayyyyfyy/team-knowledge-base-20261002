@@ -12,6 +12,9 @@
 - QUERY 缺失/空白、--sort 缺值/非法取值以退出码 2 报错，标准输出为空；
 - 无命中、根目录不存在、目录尚无索引时输出 ``[]``（退出码 0），
   不创建目录或索引；
+- 根路径不是目录、索引文件不是数据库、索引缺少 versions 表时，
+  以退出码 2 报错，标准输出为空，不输出空数组伪装成功，
+  失败检索不修复或改写输入；
 - 成功与失败检索均不改变知识库文件内容与修订记录。
 
 每个用例使用独立临时目录并在结束后清理，可离线重复运行。
@@ -22,6 +25,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -267,6 +271,66 @@ class EmptyResultTests(KbTestCase):
         self.kb.mkdir()
         self.assert_empty_array(run_cli("--root", str(self.kb), "search", "发布"))
         self.assertEqual(list(self.kb.iterdir()), [])
+
+
+class StorageUnavailableTests(KbTestCase):
+    """本地存储不可用时的检索约定。
+
+    与 EmptyResultTests 对照：根目录不存在或目录尚无索引属于“尚未初始化”，
+    返回 []（退出码 0）；而根路径不是目录、已有索引无法打开或查询失败
+    属于“已有存储不可用”，必须以退出码 2 报错，标准输出为空，
+    不输出空数组伪装成功，不泄露 Traceback，也不修复或改写输入。
+    """
+
+    QUERY = "发布"
+
+    def assert_search_fails(self, reason: str) -> None:
+        """默认排序与 --sort relevance 均以退出码 2 失败，且输入保持原样。"""
+        before = snapshot(self.tmp)
+        for extra in [(), ("--sort", "relevance")]:
+            result = run_cli(
+                "--root", str(self.kb), "search", self.QUERY, *extra
+            )
+            label = extra[-1] if extra else "默认排序"
+            self.assertEqual(
+                result.returncode, 2,
+                f"{label}: 退出码应为 2: {result.returncode}",
+            )
+            self.assertEqual(
+                result.stdout, b"",
+                f"{label}: 标准输出应为空（不得输出空数组伪装成功）: "
+                f"{result.stdout!r}",
+            )
+            err = result.stderr.decode("utf-8")
+            self.assertIn(reason, err, f"{label}: 标准错误应说明原因")
+            self.assertNotIn("Traceback", err, f"{label}: 不应泄露堆栈")
+        # 失败检索不修复或改写输入：目录条目与文件字节逐一对比，
+        # 不新增正文目录、索引表或其他文件
+        self.assertEqual(snapshot(self.tmp), before)
+
+    def test_root_is_regular_file(self):
+        # --root 指向普通文件：报告根路径不是目录
+        self.kb.write_text("占用根路径的普通文件。\n", encoding="utf-8")
+        self.assert_search_fails("不是目录")
+
+    def test_index_is_plain_text(self):
+        # 根目录存在，knowledge_base.sqlite3 是普通 UTF-8 文本
+        self.kb.mkdir()
+        (self.kb / "knowledge_base.sqlite3").write_text(
+            "这不是 SQLite 数据库，只是普通文本。\n", encoding="utf-8"
+        )
+        self.assert_search_fails("索引无法打开或查询失败")
+
+    def test_index_missing_versions_table(self):
+        # 索引是可打开的 SQLite 数据库，但没有 versions 表
+        self.kb.mkdir()
+        conn = sqlite3.connect(self.kb / "knowledge_base.sqlite3")
+        with conn:
+            conn.execute(
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY, text TEXT)"
+            )
+        conn.close()
+        self.assert_search_fails("索引无法打开或查询失败")
 
 
 class SearchArgumentErrorTests(KbTestCase):
