@@ -156,24 +156,35 @@ class Store:
     def get_body(self, doc_id: int, version: int | None = None) -> bytes:
         """读取指定版本正文；version 为 None 时读取最新版本。
 
-        所选正文文件缺失、不是普通文件或无法按 UTF-8 解码时抛出 KBError，
-        不回退到其他版本。
+        索引无法打开或查询失败（如索引文件不是有效 SQLite 数据库、
+        缺少 documents/versions 表）时抛出 KBError，错误信息含文档 ID，
+        显式指定版本时还含该版本号，但不把索引故障误报为文档或版本
+        不存在，也不回退到其他版本。
+
+        所选正文文件缺失、不是普通文件或无法按 UTF-8 解码时同样抛出
+        KBError。
         """
         self._require_initialized(doc_id)
-        with self._connect() as conn:
-            self._require_document(conn, doc_id)
-            if version is None:
-                row = conn.execute(
-                    "SELECT version, body_path FROM versions WHERE doc_id = ?"
-                    " ORDER BY version DESC LIMIT 1",
-                    (doc_id,),
-                ).fetchone()
-            else:
-                row = conn.execute(
-                    "SELECT version, body_path FROM versions WHERE doc_id = ?"
-                    " AND version = ?",
-                    (doc_id, version),
-                ).fetchone()
+        target = f"文档 {doc_id}"
+        if version is not None:
+            target += f" 的版本 {version}"
+        try:
+            with self._connect() as conn:
+                self._require_document(conn, doc_id)
+                if version is None:
+                    row = conn.execute(
+                        "SELECT version, body_path FROM versions WHERE doc_id = ?"
+                        " ORDER BY version DESC LIMIT 1",
+                        (doc_id,),
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        "SELECT version, body_path FROM versions WHERE doc_id = ?"
+                        " AND version = ?",
+                        (doc_id, version),
+                    ).fetchone()
+        except sqlite3.Error as exc:
+            raise KBError(f"索引无法打开或查询失败: {target}: {exc}") from exc
         if row is None:
             raise KBError(f"版本不存在: 文档 {doc_id} 的版本 {version}")
         selected_version, rel = row
