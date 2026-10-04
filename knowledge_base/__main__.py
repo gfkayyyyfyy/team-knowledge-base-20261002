@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+from pathlib import Path
 
 from .store import KBError, Store, read_body_file
 
@@ -72,6 +74,65 @@ def search_query_arg(value: str) -> str:
     return query
 
 
+def output_path_arg(value: str) -> str:
+    """argparse 类型：--output 的目标路径，仅拒绝空字符串。
+
+    不做空白裁剪，路径内部及首尾的空白都是路径的一部分；也不规范化、
+    不解析符号链接或要求此刻存在。相对路径按调用时工作目录解释的工作
+    交给 pathlib 与写入时的 open 完成。
+    """
+    if value == "":
+        raise argparse.ArgumentTypeError("--output 目标路径不能为空字符串")
+    return value
+
+
+def export_body(body: bytes, output_arg: str) -> None:
+    """把所选版本正文逐字节导出到 output_arg 指定的本地文件。
+
+    相对路径按调用时工作目录解释（交给 Path/open，不做 chdir 或基于
+    --root 的重解释），接受绝对路径与含空格的路径，不强制扩展名。
+    目标父目录必须已经存在且为目录；目标路径本身（文件、目录或其他
+    任何已存在条目）一律拒绝覆盖。写入用 O_CREAT|O_EXCL 独占创建，
+    因此竞态情况下也不会截断已有文件；空正文生成零字节文件。
+
+    写入失败时删除本次新建的半截文件（确认仍为本次创建的普通文件后），
+    不留残余。任何失败都以 KBError 报告，由命令行统一转为退出码 2。
+    """
+    target = Path(output_arg)
+    parent = target.parent
+    # Path("name").parent 为 Path(".")，指向当前工作目录；始终需要检查
+    if not parent.is_dir():
+        raise KBError(f"导出目标父目录不存在或不是目录: {parent}")
+    # 在独占创建前先给出明确的“已存在”错误（含目录等一切条目类型）
+    if target.exists() or target.is_symlink():
+        raise KBError(f"导出目标已存在，拒绝覆盖: {target}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        fd = os.open(target, flags, 0o666)
+    except FileExistsError:
+        raise KBError(f"导出目标已存在，拒绝覆盖: {target}")
+    except OSError as exc:
+        raise KBError(f"导出目标无法写入: {target}: {exc}")
+    try:
+        view = memoryview(body)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+    except OSError as exc:
+        os.close(fd)
+        # 仅清理本次新建且仍为普通文件的目标，避免误删竞态中出现的其他条目
+        try:
+            if target.is_file() and not target.is_symlink():
+                target.unlink()
+        except OSError:
+            pass
+        raise KBError(f"导出目标无法写入: {target}: {exc}")
+    else:
+        os.close(fd)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="knowledge_base",
@@ -92,6 +153,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_show = sub.add_parser("show", help="输出文档正文，默认最新版本")
     p_show.add_argument("id", type=positive_int, help="文档 ID")
     p_show.add_argument("--version", type=positive_int, default=None, help="版本号")
+    p_show.add_argument(
+        "--output",
+        type=output_path_arg,
+        default=None,
+        metavar="FILE",
+        help="把所选版本正文逐字节导出为本地文件；省略时原样写入标准输出",
+    )
 
     p_history = sub.add_parser("history", help="列出文档全部版本")
     p_history.add_argument("id", type=positive_int, help="文档 ID")
@@ -154,9 +222,22 @@ def main(argv: list[str] | None = None) -> int:
             result = {"id": args.id, "version": version, "title": args.title}
             print(json.dumps(result, ensure_ascii=False))
         elif args.command == "show":
+            if args.output is not None:
+                # 导出入口对根路径给出明确原因（缺失/不是目录），不含糊报为文档不存在；
+                # 省略 --output 的既有报错文本保持不变
+                if not store.root.exists():
+                    raise KBError(f"知识库根目录不存在: {store.root}")
+                if not store.root.is_dir():
+                    raise KBError(f"知识库根路径不是目录: {store.root}")
+                if not store.db_path.is_file():
+                    raise KBError(f"索引缺失或无法查询: {store.db_path}")
             body = store.get_body(args.id, args.version)
-            # 原样输出正文，不额外添加标题或换行
-            sys.stdout.buffer.write(body)
+            if args.output is None:
+                # 原样输出正文，不额外添加标题或换行
+                sys.stdout.buffer.write(body)
+            else:
+                # 先成功读取所选版本正文，再执行导出；失败不产生文件
+                export_body(body, args.output)
         elif args.command == "history":
             print(json.dumps(store.history(args.id), ensure_ascii=False))
         elif args.command == "diff":
