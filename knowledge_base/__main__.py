@@ -40,6 +40,19 @@ def limit_arg(value: str) -> int:
     return number
 
 
+def offset_arg(value: str) -> int:
+    """argparse 类型：--offset 的偏移量参数，仅接受非负整数。
+
+    只接受 ASCII 十进制数字组成的非空串，允许 0 与前导零；不接受
+    空值、正负号、空白、小数点、下划线或非 ASCII 数字字符。
+    """
+    if not value or not all("0" <= ch <= "9" for ch in value):
+        raise argparse.ArgumentTypeError(
+            f"偏移量参数必须是非负整数: {value!r}"
+        )
+    return int(value)
+
+
 def title_arg(value: str) -> str:
     """argparse 类型：去除首尾空白后非空的单行标题。"""
     title = value.strip()
@@ -114,6 +127,13 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="只返回当前排序下最前面的 N 条结果，N 为正整数；省略时返回全部命中",
     )
+    p_search.add_argument(
+        "--offset",
+        type=offset_arg,
+        default=0,
+        metavar="M",
+        help="跳过最终排序结果中的前 M 条命中，M 为非负整数；省略时等于 0",
+    )
 
     return parser
 
@@ -146,7 +166,12 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "search":
             print(
                 json.dumps(
-                    store.search(args.query, sort=args.sort, limit=args.limit),
+                    store.search(
+                        args.query,
+                        sort=args.sort,
+                        limit=args.limit,
+                        offset=args.offset,
+                    ),
                     ensure_ascii=False,
                 )
             )

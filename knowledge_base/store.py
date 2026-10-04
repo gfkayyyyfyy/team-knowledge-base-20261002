@@ -244,7 +244,11 @@ class Store:
         return [{"version": version, "title": title} for version, title in rows]
 
     def search(
-        self, query: str, sort: str = "id", limit: int | None = None
+        self,
+        query: str,
+        sort: str = "id",
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[dict]:
         """按每篇文档的最新标题做忽略大小写的字面子串匹配。
 
@@ -259,6 +263,11 @@ class Store:
 
         limit 为正整数时，在最终排序完成后只保留前 limit 条；命中少于
         limit 条时返回全部命中，不补空项。limit 为 None 时返回全部命中。
+
+        offset 为非负整数时，在最终排序完成、应用 limit 之前先跳过前
+        offset 条命中（偏移量统计的是命中条数，不是文档 ID）；偏移量
+        等于或超过命中总数时返回 []，剩余不足时原样返回剩余结果，不补
+        空项。offset 为 0 时不跳过任何命中。
 
         根目录不存在或目录下尚无索引文件时返回 []，不创建目录或索引；
         根路径不是目录，或已有索引无法打开/完成查询时抛出 KBError。
@@ -300,6 +309,9 @@ class Store:
                 return 2
 
             hits.sort(key=lambda item: (group(item), item["id"]))
+        if offset:
+            # 偏移量作用于最终排序结果，先于数量上限
+            hits = hits[offset:]
         if limit is not None:
             # 数量上限作用于最终排序结果；命中不足时切片原样返回全部
             hits = hits[:limit]
