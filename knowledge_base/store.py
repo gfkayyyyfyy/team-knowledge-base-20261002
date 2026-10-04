@@ -232,15 +232,28 @@ class Store:
         )
 
     def history(self, doc_id: int) -> list[dict]:
-        """按版本号升序返回 [{version, title}, ...]，不产生修订。"""
+        """按版本号升序返回 [{version, title}, ...]，不产生修订。
+
+        索引文件存在但无法作为 SQLite 打开，或查询因缺少 documents、
+        versions 表而失败时，抛出 KBError 报为索引读取失败（错误信息含
+        文档 ID），不向调用者泄露 sqlite3 异常，也不误报为文档不存在、
+        不返回空数组或部分历史。根目录不存在或尚无索引文件时沿用文档
+        不存在语义，不创建目录或索引。历史只依赖索引中的版本与标题，
+        不校验正文文件；查询不改写索引、正文，也不产生新版本。
+        """
         self._require_initialized(doc_id)
-        with self._connect() as conn:
-            self._require_document(conn, doc_id)
-            rows = conn.execute(
-                "SELECT version, title FROM versions WHERE doc_id = ?"
-                " ORDER BY version ASC",
-                (doc_id,),
-            ).fetchall()
+        try:
+            with self._connect() as conn:
+                self._require_document(conn, doc_id)
+                rows = conn.execute(
+                    "SELECT version, title FROM versions WHERE doc_id = ?"
+                    " ORDER BY version ASC",
+                    (doc_id,),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise KBError(
+                f"索引无法打开或查询失败: 文档 {doc_id}: {exc}"
+            ) from exc
         return [{"version": version, "title": title} for version, title in rows]
 
     def search(
