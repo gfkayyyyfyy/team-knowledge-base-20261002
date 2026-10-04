@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+import os
 import sqlite3
 from pathlib import Path
 
@@ -193,7 +194,13 @@ class Store:
                 f"正文文件缺失或不是普通文件: 文档 {doc_id} 的版本"
                 f" {selected_version} ({rel})"
             )
-        data = path.read_bytes()
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise KBError(
+                f"正文无法读取: 文档 {doc_id} 的版本"
+                f" {selected_version} ({rel}): {exc}"
+            ) from exc
         try:
             data.decode("utf-8")
         except UnicodeDecodeError:
@@ -202,6 +209,43 @@ class Store:
                 f" {selected_version} ({rel})"
             )
         return data
+
+    def export_body(self, doc_id: int, version: int | None, output: str) -> None:
+        """把所选版本正文逐字节导出到 output 指定的本地文件。
+
+        目标路径按调用时的工作目录解释（相对或绝对均可），不强制扩展名；
+        父目录必须已经存在且是目录，导出功能不创建目录。目标已存在时一律
+        拒绝（无论文件还是目录、内容是否相同，包括指向知识库已有正文）。
+        写入使用排他创建，写入失败时清理本次新建的文件，不改动已有目标。
+
+        根目录不存在或不是目录、索引缺失或无法查询、文档或版本不存在、
+        源正文缺失/不是普通文件/无法读取/不是 UTF-8 时抛出 KBError，不
+        回退到其他版本。本方法不修改源正文、索引与历史，不生成新版本，
+        也不初始化知识库。
+        """
+        if not self.root.is_dir():
+            raise KBError(f"知识库根目录不存在或不是目录: {self.root}")
+        if not self.db_path.is_file():
+            raise KBError(f"索引缺失，无法查询: {self.db_path}")
+        body = self.get_body(doc_id, version)
+        target = Path(output)
+        if os.path.lexists(target):
+            raise KBError(f"导出目标已存在: {output}")
+        if not target.parent.is_dir():
+            raise KBError(f"导出目标的父目录不存在或不是目录: {output}")
+        try:
+            with open(target, "xb") as fh:
+                fh.write(body)
+        except FileExistsError:
+            # 排他创建发现目标已存在（如并发创建），不触碰该目标
+            raise KBError(f"导出目标已存在: {output}") from None
+        except OSError as exc:
+            # 写入失败时清理本次可能新建的不完整文件，不留下残留
+            try:
+                target.unlink()
+            except OSError:
+                pass
+            raise KBError(f"导出目标无法写入: {output}: {exc}") from exc
 
     def diff(self, doc_id: int, from_version: int, to_version: int) -> str:
         """对比同一文档两个版本的正文，返回统一差异文本（可能为空串）。

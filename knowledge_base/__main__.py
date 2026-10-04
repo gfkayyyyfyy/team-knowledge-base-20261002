@@ -72,6 +72,13 @@ def search_query_arg(value: str) -> str:
     return query
 
 
+def output_arg(value: str) -> str:
+    """argparse 类型：--output 的导出路径，拒绝空字符串，其余原样保留。"""
+    if not value:
+        raise argparse.ArgumentTypeError("导出路径不能为空字符串")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="knowledge_base",
@@ -92,6 +99,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_show = sub.add_parser("show", help="输出文档正文，默认最新版本")
     p_show.add_argument("id", type=positive_int, help="文档 ID")
     p_show.add_argument("--version", type=positive_int, default=None, help="版本号")
+    p_show.add_argument(
+        "--output",
+        type=output_arg,
+        default=None,
+        metavar="FILE",
+        help="把所选版本正文逐字节导出到本地文件；目标必须不存在且父目录已存在。"
+        "省略时正文仍写入标准输出",
+    )
 
     p_history = sub.add_parser("history", help="列出文档全部版本")
     p_history.add_argument("id", type=positive_int, help="文档 ID")
@@ -154,9 +169,13 @@ def main(argv: list[str] | None = None) -> int:
             result = {"id": args.id, "version": version, "title": args.title}
             print(json.dumps(result, ensure_ascii=False))
         elif args.command == "show":
-            body = store.get_body(args.id, args.version)
-            # 原样输出正文，不额外添加标题或换行
-            sys.stdout.buffer.write(body)
+            if args.output is None:
+                body = store.get_body(args.id, args.version)
+                # 原样输出正文，不额外添加标题或换行
+                sys.stdout.buffer.write(body)
+            else:
+                # 导出成功时标准输出与标准错误均为空
+                store.export_body(args.id, args.version, args.output)
         elif args.command == "history":
             print(json.dumps(store.history(args.id), ensure_ascii=False))
         elif args.command == "diff":
