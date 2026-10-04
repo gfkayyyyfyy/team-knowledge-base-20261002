@@ -11,8 +11,13 @@
 - 只匹配最新标题，不搜正文与历史标题；
 - ``--limit N`` 在最终排序后截取前 N 条，与不设上限的同一次查询前 N 条
   完全一致，命中不足时返回全部，不补空项、不附加总数或截断提示；
+- ``--offset M`` 在最终排序之后、``--limit`` 之前跳过前 M 条命中（统计
+  命中条数而非文档 ID），省略时等于 0，允许 0 与前导零；偏移量等于或
+  超过命中总数时输出 ``[]``，剩余不足时原样返回剩余结果；
 - QUERY 缺失/空白、--sort 缺值/非法取值、--limit 缺值或不是正整数
-  （空值、零、负数、小数、非整数字符串）以退出码 2 报错，标准输出为空；
+  （空值、零、负数、小数、非整数字符串）、--offset 缺值或不是非负整数
+  （空值、负数、带正号、带空白、小数、下划线、非 ASCII 数字）
+  以退出码 2 报错，标准输出为空；
 - 无命中、根目录不存在、目录尚无索引时输出 ``[]``（退出码 0），
   不创建目录或索引；
 - 根路径不是目录、索引文件不是数据库、索引缺少 versions 表时，
@@ -270,22 +275,26 @@ class RelevanceSortTests(KbTestCase):
         before_files = snapshot(self.kb)
         before_history = self.histories(self.ids)
 
-        # 成功检索：默认、显式 id、relevance，以及带上限的查询
+        # 成功检索：默认、显式 id、relevance，以及带上限/偏移量的查询
         for extra in [
             (),
             ("--sort", "id"),
             ("--sort", "relevance"),
             ("--limit", "2"),
             ("--sort", "relevance", "--limit", "2"),
+            ("--offset", "1"),
+            ("--sort", "relevance", "--offset", "1", "--limit", "2"),
         ]:
             result = run_cli("--root", str(self.kb), "search", "发布", *extra)
             self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8"))
-        # 失败检索：QUERY 空白、--sort 非法取值、--limit 非法取值
+        # 失败检索：QUERY 空白、--sort 非法取值、--limit/--offset 非法取值
         for args in [
             ("   ",),
             ("发布", "--sort", "name"),
             ("发布", "--limit", "0"),
             ("发布", "--limit", "1.5"),
+            ("发布", "--offset", "-1"),
+            ("发布", "--offset", "1.5"),
         ]:
             result = run_cli("--root", str(self.kb), "search", *args)
             self.assertEqual(result.returncode, 2)
@@ -293,6 +302,118 @@ class RelevanceSortTests(KbTestCase):
 
         self.assertEqual(snapshot(self.kb), before_files)
         self.assertEqual(self.histories(self.ids), before_history)
+
+
+class OffsetTests(KbTestCase):
+    """--offset 在最终排序之后、--limit 之前跳过前 M 条命中。"""
+
+    TITLES = ["发布检查", "预发布清单", "发布", "发布记录"]
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.docs = [self.add_doc(t, f"{t} 的正文。\n") for t in self.TITLES]
+        self.ids = [d["id"] for d in self.docs]
+
+    def entry(self, index: int, version: int = 1) -> dict:
+        return {"id": self.ids[index], "version": version,
+                "title": self.TITLES[index]}
+
+    def test_offset_with_relevance_sort_and_limit(self):
+        # 验收场景：relevance 完整顺序为 3、1、4、2，
+        # --offset 1 --limit 2 只返回 ID 1 与 4
+        self.assert_search(
+            "发布",
+            [self.entry(0), self.entry(3)],
+            "--sort", "relevance", "--offset", "1", "--limit", "2",
+        )
+
+    def test_offset_three_with_relevance_sort(self):
+        # 验收场景：偏移量改为 3 后只返回 ID 2
+        self.assert_search(
+            "发布",
+            [self.entry(1)],
+            "--sort", "relevance", "--offset", "3",
+        )
+
+    def test_offset_counts_hits_not_doc_ids(self):
+        # 偏移量统计命中条数：id 排序下 --offset 2 跳过前两篇命中，
+        # 与文档 ID 数值无关
+        self.assert_search(
+            "发布",
+            [self.entry(2), self.entry(3)],
+            "--offset", "2",
+        )
+
+    def test_offset_zero_and_leading_zeros_equal_no_offset(self):
+        expected = [self.entry(i) for i in range(4)]
+        self.assert_search("发布", expected, "--offset", "0")
+        self.assert_search("发布", expected, "--offset", "000")
+
+    def test_offset_only_returns_all_remaining(self):
+        # 只给偏移量时返回其后的全部命中
+        self.assert_search(
+            "发布",
+            [self.entry(0), self.entry(3), self.entry(1)],
+            "--sort", "relevance", "--offset", "1",
+        )
+
+    def test_offset_equal_to_hit_count_returns_empty(self):
+        self.assert_search("发布", [], "--offset", "4")
+
+    def test_offset_beyond_hit_count_returns_empty(self):
+        self.assert_search("发布", [], "--offset", "99")
+        self.assert_search(
+            "发布", [], "--sort", "relevance", "--offset", "99", "--limit", "2"
+        )
+
+    def test_offset_with_limit_larger_than_remaining(self):
+        # 剩余 2 条、上限 9 时返回剩余 2 条，不补空项
+        self.assert_search(
+            "发布",
+            [self.entry(2), self.entry(3)],
+            "--offset", "2", "--limit", "9",
+        )
+
+    def test_offset_results_equal_slice_of_full_sorted_results(self):
+        # 各排序下，带 --offset/--limit 的结果与完整排序结果的对应片段一致
+        for extra in [(), ("--sort", "id"), ("--sort", "relevance")]:
+            full = run_cli("--root", str(self.kb), "search", "发布", *extra)
+            self.assertEqual(full.returncode, 0, full.stderr.decode("utf-8"))
+            full_hits = json.loads(full.stdout)
+            for offset, limit in [(0, None), (1, 2), (3, None), (4, 1)]:
+                args = list(extra) + ["--offset", str(offset)]
+                if limit is not None:
+                    args += ["--limit", str(limit)]
+                result = run_cli(
+                    "--root", str(self.kb), "search", "发布", *args
+                )
+                self.assertEqual(
+                    result.returncode, 0, result.stderr.decode("utf-8")
+                )
+                self.assertEqual(result.stderr, b"")
+                end = None if limit is None else offset + limit
+                self.assertEqual(json.loads(result.stdout), full_hits[offset:end])
+
+    def test_offset_does_not_append_total_or_page_metadata(self):
+        # 输出仅为 JSON 数组本身，不增加总数、页码或其他元数据
+        result = run_cli(
+            "--root", str(self.kb), "search", "发布", "--offset", "1"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8"))
+        hits = json.loads(result.stdout)
+        self.assertEqual(len(hits), 3)
+        self.assertEqual(result.stdout.decode("utf-8").count("{"), 3)
+        for hit in hits:
+            self.assertEqual(set(hit), {"id", "version", "title"})
+
+    def test_offset_after_update_counts_latest_hits_only(self):
+        # 第三篇更新为不含“发布”的标题后，偏移量只统计最新标题的命中
+        self.update_doc(self.ids[2], "归档说明", "正文仍然提到发布。\n")
+        self.assert_search(
+            "发布",
+            [self.entry(1), self.entry(3)],
+            "--offset", "1",
+        )
 
 
 class UnicodeCasefoldTests(KbTestCase):
@@ -371,6 +492,16 @@ class EmptyResultTests(KbTestCase):
             )
         )
 
+    def test_no_hits_with_offset(self):
+        # 无命中时即使给出合法偏移量也输出 []，不补空项
+        self.add_doc("发布流程", "正文。\n")
+        self.assert_empty_array(
+            run_cli(
+                "--root", str(self.kb), "search", "不存在的关键词",
+                "--offset", "2",
+            )
+        )
+
     def test_missing_root_returns_empty_and_creates_nothing(self):
         missing = self.tmp / "no_such_dir"
         self.assert_empty_array(run_cli("--root", str(missing), "search", "发布"))
@@ -381,6 +512,15 @@ class EmptyResultTests(KbTestCase):
         self.assert_empty_array(
             run_cli(
                 "--root", str(missing), "search", "发布", "--limit", "2"
+            )
+        )
+        self.assertFalse(missing.exists())
+
+    def test_missing_root_with_valid_offset_returns_empty_and_creates_nothing(self):
+        missing = self.tmp / "no_such_dir"
+        self.assert_empty_array(
+            run_cli(
+                "--root", str(missing), "search", "发布", "--offset", "2"
             )
         )
         self.assertFalse(missing.exists())
@@ -399,6 +539,15 @@ class EmptyResultTests(KbTestCase):
         )
         self.assertEqual(list(self.kb.iterdir()), [])
 
+    def test_dir_without_index_with_offset_returns_empty_and_creates_nothing(self):
+        self.kb.mkdir()
+        self.assert_empty_array(
+            run_cli(
+                "--root", str(self.kb), "search", "发布", "--offset", "2"
+            )
+        )
+        self.assertEqual(list(self.kb.iterdir()), [])
+
 
 class StorageUnavailableTests(KbTestCase):
     """本地存储不可用时的检索约定。
@@ -412,9 +561,10 @@ class StorageUnavailableTests(KbTestCase):
     QUERY = "发布"
 
     def assert_search_fails(self, reason: str) -> None:
-        """默认排序与 --sort relevance（含合法 --limit）均以退出码 2 失败。
+        """默认排序与 --sort relevance（含合法 --limit/--offset）均以退出码 2 失败。
 
-        合法上限不改变存储不可用的报错约定，且输入保持原样。
+        合法上限与偏移量（即使很大）不改变存储不可用的报错约定，
+        且输入保持原样。
         """
         before = snapshot(self.tmp)
         for extra in [
@@ -422,6 +572,9 @@ class StorageUnavailableTests(KbTestCase):
             ("--sort", "relevance"),
             ("--limit", "2"),
             ("--sort", "relevance", "--limit", "2"),
+            ("--offset", "2"),
+            ("--offset", "999999"),
+            ("--sort", "relevance", "--offset", "999999", "--limit", "2"),
         ]:
             result = run_cli(
                 "--root", str(self.kb), "search", self.QUERY, *extra
@@ -497,6 +650,37 @@ class SearchArgumentErrorTests(KbTestCase):
     def test_limit_missing_value(self):
         self.assert_error(("发布", "--limit"), "expected one argument")
 
+    def test_offset_missing_value(self):
+        self.assert_error(("发布", "--offset"), "expected one argument")
+
+    def test_offset_empty_value(self):
+        # 通过 argv 显式传入空串：指出偏移量参数问题，而不是缺值文案
+        self.assert_error(("发布", "--offset", ""), "偏移量参数")
+
+    def test_offset_negative(self):
+        self.assert_error(("发布", "--offset", "-1"), "偏移量参数")
+
+    def test_offset_non_integer_string(self):
+        # 带正号、带空白、小数、下划线与非 ASCII 数字同样拒绝
+        for bad in ["abc", "二", "1e3", "0x2", " 2", "2 ", "+2", "1_000",
+                    "²", "1.0", "2.5"]:
+            with self.subTest(bad=bad):
+                self.assert_error(("发布", "--offset", bad), "偏移量参数")
+
+    def test_offset_invalid_even_when_root_missing(self):
+        # 即使根目录不存在，非法偏移量也不能被当成成功的空结果：
+        # 参数解析先于存储访问，退出码 2、标准输出为空
+        missing = self.tmp / "no_such_dir"
+        for bad in ["", "-1", "+1", "1.5", "abc"]:
+            with self.subTest(bad=bad):
+                result = run_cli(
+                    "--root", str(missing), "search", "发布", "--offset", bad
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, b"")
+                self.assertIn("--offset", result.stderr.decode("utf-8"))
+        self.assertFalse(missing.exists())
+
     def test_limit_empty_value(self):
         # 通过 argv 显式传入空串：指出数量参数问题，而不是缺值文案
         self.assert_error(("发布", "--limit", ""), "数量参数")
@@ -534,6 +718,7 @@ class SearchArgumentErrorTests(KbTestCase):
         # 参数错误在访问存储之前失败，不创建知识库目录
         self.assert_error(("   ",), "QUERY")
         self.assert_error(("发布", "--limit", "0"), "数量参数")
+        self.assert_error(("发布", "--offset", "-1"), "偏移量参数")
         self.assertFalse(self.kb.exists())
 
 
