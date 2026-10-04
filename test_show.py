@@ -11,6 +11,10 @@
 - 所选版本正文缺失、变成目录或含非法 UTF-8 时，退出码 2、标准输出为空，
   标准错误包含文档 ID、所选版本号与对应原因，不泄露 Traceback；
   默认读取受损最新版本与显式指定该版本结果一致，不回退到旧版本；
+- 索引文件不是有效 SQLite 数据库，或缺少 documents、versions 表而无法
+  查询时，退出码 2、标准输出为空，标准错误含“索引无法打开或查询失败”、
+  文档 ID（显式指定版本时还含请求的版本号），不误报为文档或版本不存在，
+  不输出空正文、不从正文目录猜测版本、不回退其他版本；
 - 受损版本之外的健康版本仍可原样读取，history 仍返回全部修订；
 - 失败读取不改变知识库目录条目与文件字节。
 
@@ -22,6 +26,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -111,6 +116,28 @@ class ShowTestCase(unittest.TestCase):
             return "缺失或不是普通文件"
         body.write_bytes(b"\xff\xfe invalid \x80")
         return "UTF-8"
+
+    def make_plain_text_index(self) -> int:
+        """把索引文件替换为普通 UTF-8 文本，即不是有效的 SQLite 数据库。"""
+        self.kb.mkdir(parents=True, exist_ok=True)
+        (self.kb / "knowledge_base.sqlite3").write_bytes(
+            "这是一段普通 UTF-8 文本，不是 SQLite 数据库\n".encode("utf-8")
+        )
+        return 1
+
+    def make_documents_only_index(self) -> int:
+        """创建只有 documents 表（含 ID 为 1 的记录）、没有 versions 表的索引。"""
+        self.kb.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self.kb / "knowledge_base.sqlite3")
+        try:
+            conn.execute(
+                "CREATE TABLE documents (id INTEGER PRIMARY KEY AUTOINCREMENT)"
+            )
+            conn.execute("INSERT INTO documents (id) VALUES (1)")
+            conn.commit()
+        finally:
+            conn.close()
+        return 1
 
     def show(self, doc_id: int, *extra: str) -> subprocess.CompletedProcess:
         return run_cli("--root", str(self.kb), "show", str(doc_id), *extra)
@@ -238,6 +265,69 @@ class ValidBodyTests(ShowTestCase):
                 self.kb = self.tmp / f"kb_{name}"
                 doc = self.add_doc("合法正文", content)
                 self.assert_show_ok(doc["id"], content)
+
+
+class BrokenIndexTests(ShowTestCase):
+    """索引本身无法打开或查询：统一按索引读取失败处理，而非文档/版本缺失。"""
+
+    REASON = "索引无法打开或查询失败"
+
+    def assert_index_failure(
+        self, result: subprocess.CompletedProcess, doc_id: int, label: str,
+        version: int | None = None,
+    ) -> None:
+        """断言索引读取失败：退出码 2、输出为空、错误含原因与文档 ID。
+
+        显式指定版本时还要求标准错误包含请求的版本号，并且不得把索引故障
+        误报为文档或版本不存在。
+        """
+        self.assertEqual(result.returncode, 2,
+                         f"{label}: 退出码 {result.returncode}")
+        self.assertEqual(result.stdout, b"",
+                         f"{label}: 标准输出应为空: {result.stdout!r}")
+        err = result.stderr.decode("utf-8")
+        self.assertNotIn("Traceback", err, f"{label}: 不应泄露堆栈\n{err}")
+        self.assertIn(self.REASON, err, f"{label}: 应报索引读取失败\n{err}")
+        self.assertIn(str(doc_id), err, f"{label}: 应含文档 ID\n{err}")
+        self.assertNotIn("文档不存在", err, f"{label}: 不应误报文档不存在\n{err}")
+        self.assertNotIn("版本不存在", err, f"{label}: 不应误报版本不存在\n{err}")
+        if version is not None:
+            self.assertIn(str(version), err,
+                          f"{label}: 应含请求的版本号\n{err}")
+
+    def test_plain_text_index_fails_for_default_and_version(self):
+        for name, build in [
+            ("plain_text", self.make_plain_text_index),
+            ("documents_only", self.make_documents_only_index),
+        ]:
+            with self.subTest(index=name):
+                self.kb = self.tmp / f"kb_bad_index_{name}"
+                doc_id = build()
+                # 预置一个与损坏索引无关的正文目录，验证不会从中猜测版本
+                (self.kb / "bodies" / str(doc_id)).mkdir(parents=True)
+                (self.kb / "bodies" / str(doc_id) / "v1.md").write_bytes(
+                    "不应被读取的正文\n".encode("utf-8")
+                )
+                before = snapshot(self.kb)
+
+                default = self.show(doc_id)
+                self.assert_index_failure(default, doc_id, f"{name} 默认")
+
+                explicit = self.show(doc_id, "--version", "1")
+                self.assert_index_failure(
+                    explicit, doc_id, f"{name} 显式版本", version=1
+                )
+
+                # 失败读取不改变知识库目录条目与文件字节
+                self.assertEqual(snapshot(self.kb), before)
+
+    def test_broken_index_does_not_initialize_or_modify_root(self):
+        self.kb = self.tmp / "kb_bad_index_ro"
+        self.make_plain_text_index()
+        before = snapshot(self.kb)
+        result = self.show(1, "--version", "3")
+        self.assert_index_failure(result, 1, "只读性", version=3)
+        self.assertEqual(snapshot(self.kb), before)
 
 
 if __name__ == "__main__":

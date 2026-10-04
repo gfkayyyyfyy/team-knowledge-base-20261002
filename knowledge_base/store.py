@@ -157,23 +157,33 @@ class Store:
         """读取指定版本正文；version 为 None 时读取最新版本。
 
         所选正文文件缺失、不是普通文件或无法按 UTF-8 解码时抛出 KBError，
-        不回退到其他版本。
+        不回退到其他版本。索引文件无法作为 SQLite 打开，或缺少查询所需的
+        documents、versions 表时，同样以 KBError 报为索引读取失败（错误信息
+        含文档 ID；显式指定版本时还含请求的版本号），不误报为文档或版本
+        不存在。
         """
         self._require_initialized(doc_id)
-        with self._connect() as conn:
-            self._require_document(conn, doc_id)
+        try:
+            with self._connect() as conn:
+                self._require_document(conn, doc_id)
+                if version is None:
+                    row = conn.execute(
+                        "SELECT version, body_path FROM versions WHERE doc_id = ?"
+                        " ORDER BY version DESC LIMIT 1",
+                        (doc_id,),
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        "SELECT version, body_path FROM versions WHERE doc_id = ?"
+                        " AND version = ?",
+                        (doc_id, version),
+                    ).fetchone()
+        except sqlite3.Error as exc:
             if version is None:
-                row = conn.execute(
-                    "SELECT version, body_path FROM versions WHERE doc_id = ?"
-                    " ORDER BY version DESC LIMIT 1",
-                    (doc_id,),
-                ).fetchone()
+                detail = f"文档 {doc_id}"
             else:
-                row = conn.execute(
-                    "SELECT version, body_path FROM versions WHERE doc_id = ?"
-                    " AND version = ?",
-                    (doc_id, version),
-                ).fetchone()
+                detail = f"文档 {doc_id} 的版本 {version}"
+            raise KBError(f"索引无法打开或查询失败: {detail}: {exc}") from exc
         if row is None:
             raise KBError(f"版本不存在: 文档 {doc_id} 的版本 {version}")
         selected_version, rel = row
