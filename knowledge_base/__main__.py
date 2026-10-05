@@ -128,8 +128,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="差异新侧版本号（正整数）",
     )
 
-    p_search = sub.add_parser("search", help="按最新标题字面子串检索文档")
+    p_search = sub.add_parser("search", help="按最新标题字面匹配检索文档")
     p_search.add_argument("query", metavar="QUERY", type=search_query_arg, help="标题查询词")
+    p_search.add_argument(
+        "--match",
+        choices=["contains", "exact"],
+        default="contains",
+        help="匹配方式：contains 为子串匹配（默认）；exact 只接受完整标题相等",
+    )
     p_search.add_argument(
         "--sort",
         choices=["id", "relevance"],
@@ -191,6 +197,7 @@ def main(argv: list[str] | None = None) -> int:
                         sort=args.sort,
                         limit=args.limit,
                         offset=args.offset,
+                        match=args.match,
                     ),
                     ensure_ascii=False,
                 )

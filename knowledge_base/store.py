@@ -315,17 +315,22 @@ class Store:
         sort: str = "id",
         limit: int | None = None,
         offset: int = 0,
+        match: str = "contains",
     ) -> list[dict]:
-        """按每篇文档的最新标题做忽略大小写的字面子串匹配。
+        """按每篇文档的最新标题做忽略大小写的字面匹配。
 
         匹配在 Python 端用 str.casefold 完成，%、_、*、[、] 等均为普通
         字符，不读取正文与历史标题。返回 [{id, version, title}, ...]，
         标题保留原文，不产生任何修订或文件。
 
+        match 为 "contains"（默认）时做子串匹配；为 "exact" 时只接受
+        完整标题与查询词相等（casefold 后），前缀与中间包含均不算命中。
+
         sort 为 "id"（默认）时按文档 ID 升序；为 "relevance" 时按标题
         匹配程度分组：完全相等的最前，以查询词开头的其次，其余包含
         查询词的最后，同组内按文档 ID 升序。分组沿用与匹配相同的
         casefold 语义，不按出现次数、标题长度或版本号再排序。
+        match 为 "exact" 时两种排序均按文档 ID 升序。
 
         limit 为正整数时，在最终排序与偏移完成后只保留前 limit 条；命中
         不足时返回全部剩余命中，不补空项。limit 为 None 时不设上限。
@@ -341,6 +346,8 @@ class Store:
         """
         if sort not in ("id", "relevance"):
             raise KBError(f"未知的排序方式: {sort}")
+        if match not in ("contains", "exact"):
+            raise KBError(f"未知的匹配方式: {match}")
         if self.root.exists() and not self.root.is_dir():
             raise KBError(f"知识库根路径不是目录: {self.root}")
         if not self.root.is_dir() or not self.db_path.exists():
@@ -361,12 +368,19 @@ class Store:
                 ).fetchall()
         except sqlite3.Error as exc:
             raise KBError(f"索引无法打开或查询失败: {exc}") from exc
-        hits = [
-            {"id": doc_id, "version": version, "title": title}
-            for doc_id, version, title in rows
-            if needle in title.casefold()
-        ]
-        if sort == "relevance":
+        if match == "exact":
+            hits = [
+                {"id": doc_id, "version": version, "title": title}
+                for doc_id, version, title in rows
+                if needle == title.casefold()
+            ]
+        else:
+            hits = [
+                {"id": doc_id, "version": version, "title": title}
+                for doc_id, version, title in rows
+                if needle in title.casefold()
+            ]
+        if sort == "relevance" and match != "exact":
             def group(item: dict) -> int:
                 folded = item["title"].casefold()
                 if folded == needle:
