@@ -138,13 +138,25 @@ class Store:
         return doc_id, version
 
     def update(self, doc_id: int, title: str, data: bytes) -> int:
-        """更新已有文档，生成下一个连续版本，返回新版本号。"""
+        """更新已有文档，生成下一个连续版本，返回新版本号。
+
+        索引文件无法作为 SQLite 打开，或缺少查询所需的 documents、versions
+        表时，在确认文档与读取当前版本阶段即以 KBError 报为索引读取失败
+        （错误信息含文档 ID），退出码 2，不误报为文档不存在，不补建表、
+        不重建索引，也不写入正文或占用版本号。数据库正常但文档不存在时
+        仍报“文档不存在”。正文写入之后的故障恢复不在本方法处理范围内。
+        """
         self._require_initialized(doc_id)
         with self._connect() as conn:
-            self._require_document(conn, doc_id)
-            row = conn.execute(
-                "SELECT MAX(version) FROM versions WHERE doc_id = ?", (doc_id,)
-            ).fetchone()
+            try:
+                self._require_document(conn, doc_id)
+                row = conn.execute(
+                    "SELECT MAX(version) FROM versions WHERE doc_id = ?", (doc_id,)
+                ).fetchone()
+            except sqlite3.Error as exc:
+                raise KBError(
+                    f"索引无法打开或查询失败: 文档 {doc_id}: {exc}"
+                ) from exc
             version = (row[0] or 0) + 1
             rel = self._write_body(doc_id, version, data)
             conn.execute(

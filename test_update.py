@@ -12,6 +12,12 @@
 - 正文路径不存在、指向目录、含非法 UTF-8 字节，或文档 ID 不存在时，
   以退出码 2 结束，标准输出为空，标准错误分别说明
   正文不存在或不是普通文件、UTF-8 解码失败、文档不存在，不泄露 Traceback；
+- 索引文件存在但不是有效 SQLite 数据库，或缺少 documents、versions 表时，
+  update 在确认文档与读取当前版本阶段以退出码 2 结束：标准输出为空，
+  标准错误含目标文档 ID 与“索引无法打开或查询失败”，不泄露 Traceback、
+  不误报为文档不存在；失败不补建表、不重建索引、不写修订文件、不占用
+  版本号，目录条目与文件字节前后一致；恢复完整索引后同一更新成功生成
+  下一个版本，历史版本的标题与正文保持不变；
 - 失败更新不生成修订、不占用版本号：知识库目录条目、文件字节与 history
   在失败前后一致，随后对原文档的合法更新得到版本二。
 
@@ -23,6 +29,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -50,6 +57,20 @@ V3_BODY = "归档说明第一行：旧版本只读保留\r\n归档说明第二�
 )
 
 MISSING_DOC_ID = 999
+
+INDEX_FAILURE = "索引无法打开或查询失败"
+DOCUMENT_MISSING = "文档不存在"
+
+# 损坏索引样例使用的合法更新：新标题与含中文、空行的正文
+BROKEN_INDEX_NEW_TITLE = "更新后的标题"
+BROKEN_INDEX_NEW_BODY = (
+    "# 更新后的正文\n"
+    "\n"
+    "第一段中文说明。\n"
+    "\n"
+    "- 列表项甲\n"
+    "- 列表项乙\n"
+).encode("utf-8")
 
 
 def run_cli(*args: str) -> subprocess.CompletedProcess:
@@ -272,6 +293,127 @@ class FailedUpdateTests(UpdateTestCase):
                 self.doc_id = doc["id"]
                 target_id = self.doc_id if target is None else target
                 self.assert_failed_update(target_id, body_arg, reason, label)
+
+
+class BrokenIndexUpdateTests(UpdateTestCase):
+    """索引无法打开或查询时 update 的失败约定、不变性与恢复。
+
+    三种情形各自使用独立知识库：索引被替换为普通文本（不是 SQLite 数据库）、
+    有效 SQLite 但 documents 存在而 versions 缺失、有效 SQLite 但 documents 与
+    versions 均缺失。每种情形都保留文档 1 的版本 1 正文，再以合法的新标题和
+    含中文、空行的正文执行 update 1。
+    """
+
+    PLAIN_TEXT_BYTES = "这是一段普通 UTF-8 文本，不是 SQLite 数据库\n".encode(
+        "utf-8"
+    )
+
+    def _required_tables(self) -> set:
+        """返回索引中现存的 documents / versions 表名集合。"""
+        conn = sqlite3.connect(self.kb / "knowledge_base.sqlite3")
+        try:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        finally:
+            conn.close()
+        return {name for (name,) in rows} & {"documents", "versions"}
+
+    def _corrupt_index(self, mode: str) -> None:
+        """把健康索引破坏为对应样例；版本 1 正文保持原样不动。"""
+        db = self.kb / "knowledge_base.sqlite3"
+        if mode == "plain_text":
+            db.write_bytes(self.PLAIN_TEXT_BYTES)
+            return
+        conn = sqlite3.connect(db)
+        try:
+            if mode == "documents_only":
+                # 保留 documents 中的文档 1，仅删除 versions 表
+                conn.execute("DROP TABLE versions")
+            elif mode == "no_documents":
+                conn.execute("DROP TABLE versions")
+                conn.execute("DROP TABLE documents")
+            else:  # pragma: no cover - 仅内部使用
+                raise AssertionError(f"未知样例: {mode}")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def run_broken_index_case(self, mode: str) -> None:
+        self.kb = self.tmp / f"kb_index_{mode}"
+        doc = self.add_doc(V1_TITLE, V1_BODY)
+        self.assertEqual(doc["id"], 1)
+        self.assertEqual(doc["version"], 1)
+        db = self.kb / "knowledge_base.sqlite3"
+        healthy_index = db.read_bytes()
+        v1_path = self.kb / "bodies" / "1" / "v1.md"
+        self.assertEqual(v1_path.read_bytes(), V1_BODY)
+
+        self._corrupt_index(mode)
+        before = snapshot(self.kb)
+
+        result = run_cli(
+            "--root", str(self.kb), "update", "1",
+            "--title", BROKEN_INDEX_NEW_TITLE,
+            "--file", str(self._write_body(BROKEN_INDEX_NEW_BODY)),
+        )
+
+        # 退出码 2、标准输出为空；标准错误含目标文档 ID 与索引失败说明，
+        # 不泄露 Traceback，也不把索引故障误报为文档不存在
+        self.assertEqual(result.returncode, 2, f"{mode}: 退出码应为 2")
+        self.assertEqual(
+            result.stdout, b"",
+            f"{mode}: 标准输出应为空: {result.stdout!r}",
+        )
+        err = result.stderr.decode("utf-8")
+        self.assertNotIn("Traceback", err, f"{mode}: 不应泄露堆栈\n{err}")
+        self.assertIn(INDEX_FAILURE, err, f"{mode}: 应报索引读取失败\n{err}")
+        self.assertIn("1", err, f"{mode}: 应含目标文档 ID\n{err}")
+        self.assertNotIn(DOCUMENT_MISSING, err,
+                         f"{mode}: 不应误报文档不存在\n{err}")
+
+        # 失败前后目录条目与文件字节完全一致：不重建索引、不补建表、
+        # 不改写已有正文
+        self.assertEqual(snapshot(self.kb), before)
+        # 不新增修订文件、不占用版本号：目录中仍只有 v1.md
+        bodies = self.kb / "bodies" / "1"
+        self.assertEqual(sorted(p.name for p in bodies.iterdir()), ["v1.md"])
+        self.assertFalse((bodies / "v2.md").exists())
+        self.assertEqual(v1_path.read_bytes(), V1_BODY)
+        if mode == "plain_text":
+            # 索引仍是那段普通文本，没有被改写成 SQLite 文件
+            self.assertEqual(db.read_bytes(), self.PLAIN_TEXT_BYTES)
+        elif mode == "documents_only":
+            self.assertEqual(self._required_tables(), {"documents"})
+        else:
+            self.assertEqual(self._required_tables(), set())
+
+        # 恢复该文档原本完整的索引后，同一更新成功生成版本 2
+        db.write_bytes(healthy_index)
+        recovered = self.update_doc(1, BROKEN_INDEX_NEW_TITLE, BROKEN_INDEX_NEW_BODY)
+        self.assertEqual(
+            recovered,
+            {"id": 1, "version": 2, "title": BROKEN_INDEX_NEW_TITLE},
+        )
+        # 历史版本 1 的标题与正文不变，版本 2 为本次新正文
+        self.assertEqual(
+            self.history(1),
+            [
+                {"version": 1, "title": V1_TITLE},
+                {"version": 2, "title": BROKEN_INDEX_NEW_TITLE},
+            ],
+        )
+        self.assertEqual(self.show_bytes(1, "--version", "1"), V1_BODY)
+        self.assertEqual(self.show_bytes(1), BROKEN_INDEX_NEW_BODY)
+        self.assertEqual(v1_path.read_bytes(), V1_BODY)
+        self.assertEqual(
+            (bodies / "v2.md").read_bytes(), BROKEN_INDEX_NEW_BODY
+        )
+
+    def test_update_against_unqueryable_index(self):
+        for mode in ("plain_text", "documents_only", "no_documents"):
+            with self.subTest(index=mode):
+                self.run_broken_index_case(mode)
 
 
 if __name__ == "__main__":
