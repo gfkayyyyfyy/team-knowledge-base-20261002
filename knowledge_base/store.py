@@ -313,27 +313,34 @@ class Store:
         self,
         query: str,
         sort: str = "id",
+        match: str = "contains",
         limit: int | None = None,
         offset: int = 0,
     ) -> list[dict]:
-        """按每篇文档的最新标题做忽略大小写的字面子串匹配。
+        """按每篇文档的最新标题做忽略大小写的字面匹配。
 
         匹配在 Python 端用 str.casefold 完成，%、_、*、[、] 等均为普通
         字符，不读取正文与历史标题。返回 [{id, version, title}, ...]，
         标题保留原文，不产生任何修订或文件。
 
-        sort 为 "id"（默认）时按文档 ID 升序；为 "relevance" 时按标题
-        匹配程度分组：完全相等的最前，以查询词开头的其次，其余包含
-        查询词的最后，同组内按文档 ID 升序。分组沿用与匹配相同的
-        casefold 语义，不按出现次数、标题长度或版本号再排序。
+        match 为 "contains"（默认）时，最新标题字面子串包含查询词即命中；
+        为 "exact" 时，只在最新标题与查询词经 casefold 后完整相等时命中，
+        以查询词开头或在中间包含均不算命中。两种匹配都只比较查询词去除
+        首尾空白后的文本，内部空白原样参与比较。
+
+        sort 为 "id"（默认）时按文档 ID 升序；为 "relevance" 时仅对
+        contains 命中按标题匹配程度分组：完全相等的最前，以查询词开头的
+        其次，其余包含查询词的最后，同组内按文档 ID 升序。分组沿用与匹配
+        相同的 casefold 语义，不按出现次数、标题长度或版本号再排序。
+        exact 命中全部是完整相等，"relevance" 与 "id" 一样按文档 ID 升序。
 
         limit 为正整数时，在最终排序与偏移完成后只保留前 limit 条；命中
         不足时返回全部剩余命中，不补空项。limit 为 None 时不设上限。
 
         offset 为非负整数时，在最终排序完成后先跳过前 offset 条命中，
-        再应用 limit；offset 统计的是命中条数而非文档 ID。偏移量等于或
-        超过命中总数时返回 []，剩余不足时原样返回剩余结果，不补空项。
-        offset 为 0 时不跳过任何命中。
+        再应用 limit；offset 统计的是筛选后的命中条数而非文档 ID。偏移量
+        等于或超过命中总数时返回 []，剩余不足时原样返回剩余结果，不补
+        空项。offset 为 0 时不跳过任何命中。
 
         根目录不存在或目录下尚无索引文件时返回 []，不创建目录或索引；
         根路径不是目录，或已有索引无法打开/完成查询时抛出 KBError，
@@ -341,6 +348,8 @@ class Store:
         """
         if sort not in ("id", "relevance"):
             raise KBError(f"未知的排序方式: {sort}")
+        if match not in ("contains", "exact"):
+            raise KBError(f"未知的匹配方式: {match}")
         if self.root.exists() and not self.root.is_dir():
             raise KBError(f"知识库根路径不是目录: {self.root}")
         if not self.root.is_dir() or not self.db_path.exists():
@@ -361,12 +370,19 @@ class Store:
                 ).fetchall()
         except sqlite3.Error as exc:
             raise KBError(f"索引无法打开或查询失败: {exc}") from exc
+
+        def is_hit(title: str) -> bool:
+            folded = title.casefold()
+            if match == "exact":
+                return folded == needle
+            return needle in folded
+
         hits = [
             {"id": doc_id, "version": version, "title": title}
             for doc_id, version, title in rows
-            if needle in title.casefold()
+            if is_hit(title)
         ]
-        if sort == "relevance":
+        if sort == "relevance" and match == "contains":
             def group(item: dict) -> int:
                 folded = item["title"].casefold()
                 if folded == needle:

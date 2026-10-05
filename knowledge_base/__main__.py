@@ -131,6 +131,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_search = sub.add_parser("search", help="按最新标题字面子串检索文档")
     p_search.add_argument("query", metavar="QUERY", type=search_query_arg, help="标题查询词")
     p_search.add_argument(
+        "--match",
+        choices=["contains", "exact"],
+        default="contains",
+        help="匹配方式：contains 标题字面子串包含查询词即命中（默认）；"
+        "exact 仅在最新标题与查询词完整相等时命中，前缀与中间包含均不算",
+    )
+    p_search.add_argument(
         "--sort",
         choices=["id", "relevance"],
         default="id",
@@ -189,6 +196,7 @@ def main(argv: list[str] | None = None) -> int:
                     store.search(
                         args.query,
                         sort=args.sort,
+                        match=args.match,
                         limit=args.limit,
                         offset=args.offset,
                     ),
