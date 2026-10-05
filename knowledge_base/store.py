@@ -138,20 +138,33 @@ class Store:
         return doc_id, version
 
     def update(self, doc_id: int, title: str, data: bytes) -> int:
-        """更新已有文档，生成下一个连续版本，返回新版本号。"""
+        """更新已有文档，生成下一个连续版本，返回新版本号。
+
+        更新前需确认文档并读取当前版本：索引文件无法作为 SQLite 打开，
+        或缺少 documents、versions 表而无法完成这两步查询时，以 KBError
+        报为索引读取失败（错误信息含文档 ID），不误报为文档不存在，不
+        补建表或重建索引，也不写入本次正文、不占用版本号。数据库正常
+        但文档不存在时仍报“文档不存在”。正文写入阶段的故障恢复不在
+        本方法的只读保证范围内。
+        """
         self._require_initialized(doc_id)
-        with self._connect() as conn:
-            self._require_document(conn, doc_id)
-            row = conn.execute(
-                "SELECT MAX(version) FROM versions WHERE doc_id = ?", (doc_id,)
-            ).fetchone()
-            version = (row[0] or 0) + 1
-            rel = self._write_body(doc_id, version, data)
-            conn.execute(
-                "INSERT INTO versions (doc_id, version, title, body_path)"
-                " VALUES (?, ?, ?, ?)",
-                (doc_id, version, title, rel),
-            )
+        try:
+            with self._connect() as conn:
+                self._require_document(conn, doc_id)
+                row = conn.execute(
+                    "SELECT MAX(version) FROM versions WHERE doc_id = ?", (doc_id,)
+                ).fetchone()
+                version = (row[0] or 0) + 1
+                rel = self._write_body(doc_id, version, data)
+                conn.execute(
+                    "INSERT INTO versions (doc_id, version, title, body_path)"
+                    " VALUES (?, ?, ?, ?)",
+                    (doc_id, version, title, rel),
+                )
+        except sqlite3.Error as exc:
+            raise KBError(
+                f"索引无法打开或查询失败: 文档 {doc_id}: {exc}"
+            ) from exc
         return version
 
     def get_body(self, doc_id: int, version: int | None = None) -> bytes:

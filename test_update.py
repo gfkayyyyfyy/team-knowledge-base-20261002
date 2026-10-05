@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -272,6 +273,171 @@ class FailedUpdateTests(UpdateTestCase):
                 self.doc_id = doc["id"]
                 target_id = self.doc_id if target is None else target
                 self.assert_failed_update(target_id, body_arg, reason, label)
+
+
+class BrokenIndexUpdateTests(UpdateTestCase):
+    """更新前读取索引失败：退出码 2、标准输出为空、索引与正文保持不变。
+
+    覆盖两类索引异常：索引文件存在但不是可查询的 SQLite 数据库（普通
+    文本），以及有效 SQLite 文件但缺少 versions 表或 documents 表。
+    每种情形独立知识库，保留文档 1 的版本一正文；失败的更新不生成
+    v2.md、不占用版本号、不补建表或重建索引。恢复完整索引后，同一
+    更新成功生成版本二，历史版本一不变。
+    """
+
+    REASON = "索引无法打开或查询失败"
+    # 合法的新标题与正文：正文含中文、空行与末尾换行
+    NEW_TITLE = "更新后的标题"
+    NEW_BODY = (
+        "# 更新后的标题\n"
+        "\n"
+        "中文更新第一段。\n"
+        "\n"
+        "- 新增条目\n"
+    ).encode("utf-8")
+
+    def _healthy_doc_one(self) -> int:
+        """建一个仅含文档 1（版本一）的健康知识库，返回文档 ID。"""
+        doc = self.add_doc(V1_TITLE, V1_BODY)
+        self.assertEqual(doc["id"], 1)
+        return doc["id"]
+
+    def _backup_index(self) -> bytes:
+        """备份当前完整索引文件字节，供失败后恢复使用。"""
+        return (self.kb / "knowledge_base.sqlite3").read_bytes()
+
+    def _replace_with_plain_text(self) -> None:
+        """把索引替换为普通 UTF-8 文本文件：存在但不是 SQLite 数据库。"""
+        (self.kb / "knowledge_base.sqlite3").write_bytes(
+            "这是一段普通 UTF-8 文本，不是 SQLite 数据库\n".encode("utf-8")
+        )
+
+    def _replace_with_documents_only(self) -> None:
+        """换成有效 SQLite：有 documents（含文档 1）但没有 versions 表。"""
+        db_path = self.kb / "knowledge_base.sqlite3"
+        db_path.unlink()
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute(
+                "CREATE TABLE documents (id INTEGER PRIMARY KEY AUTOINCREMENT)"
+            )
+            conn.execute("INSERT INTO documents (id) VALUES (1)")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _replace_without_documents_table(self) -> None:
+        """换成有效 SQLite：documents、versions 表都不存在。"""
+        db_path = self.kb / "knowledge_base.sqlite3"
+        db_path.unlink()
+        conn = sqlite3.connect(db_path)  # 空库，连接后立即关闭即落盘
+        conn.close()
+
+    def _assert_broken_index_update(
+        self, doc_id: int, body_file: Path, label: str
+    ) -> None:
+        """执行一次更新并固定索引失败约定与失败前后数据完全一致。"""
+        before = snapshot(self.kb)
+        v1_path = self.kb / "bodies" / str(doc_id) / "v1.md"
+        v2_path = self.kb / "bodies" / str(doc_id) / "v2.md"
+        self.assertEqual(v1_path.read_bytes(), V1_BODY)
+        self.assertFalse(v2_path.exists(), f"{label}: 失败前不应已有 v2.md")
+
+        result = run_cli(
+            "--root", str(self.kb), "update", str(doc_id),
+            "--title", self.NEW_TITLE, "--file", str(body_file),
+        )
+
+        self.assertEqual(result.returncode, 2, f"{label}: 退出码应为 2")
+        self.assertEqual(
+            result.stdout, b"", f"{label}: 标准输出应为空: {result.stdout!r}"
+        )
+        err = result.stderr.decode("utf-8")
+        self.assertNotIn("Traceback", err, f"{label}: 不应泄露堆栈\n{err}")
+        self.assertIn(self.REASON, err, f"{label}: 应报索引读取失败\n{err}")
+        self.assertIn(str(doc_id), err, f"{label}: 应含目标文档 ID\n{err}")
+        self.assertNotIn(
+            "文档不存在", err, f"{label}: 不应把索引故障误报为文档不存在\n{err}"
+        )
+
+        # 失败前后索引文件、正文与目录条目集合完全一致：不补建表、
+        # 不重建索引，不新增修订文件
+        self.assertEqual(snapshot(self.kb), before, f"{label}: 失败后数据发生变化")
+        self.assertEqual(v1_path.read_bytes(), V1_BODY)
+        self.assertFalse(v2_path.exists(), f"{label}: 失败更新不应生成 v2.md")
+
+    def _assert_recovery_update_succeeds(
+        self, doc_id: int, backup_index: bytes, body_file: Path
+    ) -> None:
+        """恢复完整索引后，同一更新成功生成版本二且版本一保持不变。"""
+        (self.kb / "knowledge_base.sqlite3").write_bytes(backup_index)
+
+        result = run_cli(
+            "--root", str(self.kb), "update", str(doc_id),
+            "--title", self.NEW_TITLE, "--file", str(body_file),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8"))
+        self.assertEqual(result.stderr, b"")
+        # 失败未占用版本号：恢复后的更新得到版本二而非版本三
+        self.assertEqual(
+            json.loads(result.stdout),
+            {"id": doc_id, "version": 2, "title": self.NEW_TITLE},
+        )
+
+        bodies = self.kb / "bodies" / str(doc_id)
+        self.assertEqual(
+            sorted(p.name for p in bodies.iterdir()), ["v1.md", "v2.md"]
+        )
+        self.assertEqual((bodies / "v1.md").read_bytes(), V1_BODY)
+        self.assertEqual((bodies / "v2.md").read_bytes(), self.NEW_BODY)
+        self.assertEqual(self.show_bytes(doc_id, "--version", "1"), V1_BODY)
+        self.assertEqual(self.show_bytes(doc_id), self.NEW_BODY)
+        self.assertEqual(
+            self.history(doc_id),
+            [
+                {"version": 1, "title": V1_TITLE},
+                {"version": 2, "title": self.NEW_TITLE},
+            ],
+        )
+
+    def test_broken_index_updates_fail_then_recovered_update_succeeds(self):
+        corruptors = [
+            ("plain_text", self._replace_with_plain_text),
+            ("documents_only", self._replace_with_documents_only),
+            ("missing_documents", self._replace_without_documents_table),
+        ]
+        for label, corrupt in corruptors:
+            with self.subTest(index=label):
+                self.kb = self.tmp / f"kb_bad_index_{label}"
+                doc_id = self._healthy_doc_one()
+                backup_index = self._backup_index()
+                # 每个用例使用独立的 body.md 输入
+                body_file = self._write_body(self.NEW_BODY)
+
+                corrupt()
+                self._assert_broken_index_update(doc_id, body_file, label)
+                self._assert_recovery_update_succeeds(
+                    doc_id, backup_index, body_file
+                )
+
+    def test_valid_index_missing_document_reports_not_found(self):
+        # 索引有效但确实没有目标文档时，仍按原约定报“文档不存在”
+        self.kb = self.tmp / "kb_bad_index_valid_missing_doc"
+        self._healthy_doc_one()
+        body_file = self._write_body(self.NEW_BODY)
+        before = snapshot(self.kb)
+
+        result = run_cli(
+            "--root", str(self.kb), "update", "999",
+            "--title", self.NEW_TITLE, "--file", str(body_file),
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        err = result.stderr.decode("utf-8")
+        self.assertIn("文档不存在", err)
+        self.assertNotIn("Traceback", err)
+        self.assertNotIn(self.REASON, err)
+        self.assertEqual(snapshot(self.kb), before)
 
 
 if __name__ == "__main__":
